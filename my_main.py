@@ -12,6 +12,7 @@ from lib.modelling_llama_mod import LlamaForCausalLM
 from lib.eval import eval_ppl, eval_ppl_trainonly
 from collections import defaultdict
 import pickle as pkl
+import random
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -83,8 +84,10 @@ def investigate_rms_fix(model_name, model, bsz=6, nsamples=128):
 		return mask_.mean().item()
 
 	def compute_updated_masks_local(prune_frac):
+		avgs = 0.0
 		for id_, (name, module) in module_map.items():
-			update_mask_one_layer(module, info_cache[name], prune_frac)
+			avgs += update_mask_one_layer(module, info_cache[name], prune_frac)
+		print('The new occupacy is : {:.3f}'.format(avgs / len(module_map)))
 
 	# add forward hooks
 	hook_handles = []
@@ -98,27 +101,24 @@ def investigate_rms_fix(model_name, model, bsz=6, nsamples=128):
 			id_  = int(name.split('.')[2])
 			module_map[id_] = (name, module)
 
-	prune_frac = 0.2
-	target = 0.5
-	n_iter = int(np.ceil(np.log(target)/ np.log(1 - prune_frac)))
 	tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-	n_layers = 32
+	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+	print(f"ppl on wikitext_train {ppl_train}, wikitext_test {ppl_test}")
+
+	prune_frac = 0.1
+	target = 0.5
+	n_iter = int(np.floor(np.log(target)/ np.log(1 - prune_frac)))
 	for i in range(n_iter):
-		for j in range(32): #(n_layers - 1, -1, -1):
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=32)
-			m_name, module = module_map[j]
-			occupancy = update_mask_one_layer(module, info_cache[m_name], prune_frac)
-			print('Layer {} - Occ - {:.3f}. Orig PPL - {:.3f}'.format(j, occupancy, this_ppl))
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples)
-# 		compute_updated_masks_local(prune_frac)
+		seed_ = random.randint(0, 1e8)
+		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
+		compute_updated_masks_local(prune_frac)
 		print('[{}] Achieved train ppl: '.format(i), this_ppl)
-		info_cache = defaultdict(dict)
-# 		compute_updated_masks_local(prune_frac)
+	
+	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+	print(f"ppl on wikitext_train {ppl_train}, wikitext_test {ppl_test}")
 
 	for handle in hook_handles:
 		handle.remove()
-# 	with open('og_llama_nsamples={}.pkl'.format(nsamples), 'wb') as handle:
-# 		pkl.dump(info_cache, handle)
 
 def investigate_model(model_name, model, bsz=12, nsamples=512):
 	info_cache = defaultdict(dict)

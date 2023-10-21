@@ -26,13 +26,13 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
 	return ppl_train, ppl_test 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0")):
+def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0"), seed=0):
 	# Set dataset
 	dataset = "wikitext2"
 
 	# Get the test loader
 	trainloader, _ = get_loaders(
-		dataset, nsamples=nsamples, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
+		dataset, nsamples=nsamples, seed=seed, seqlen=model.seqlen, tokenizer=tokenizer 
 	)
 
 	# Evaluate ppl in no grad context to avoid updating the model

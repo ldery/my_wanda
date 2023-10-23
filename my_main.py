@@ -18,67 +18,53 @@ print('torch', version('torch'))
 print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
-# def compute_updated_masks_global(prune_frac=0.5):
-# 	aggregated = []
-# 	for (name, module) in model.named_modules():
-# 		if name.endswith('mlp'): # TODO -- ldery -- make some changes here
-# 			avg_act_magnitudes = info_cache[name]['in'][1] / info_cache[name]['in'][0]
-# 			if module.layer_mask is not None:
-# 				avg_act_magnitudes = (module.layer_mask * avg_act_magnitudes)
-# 			aggregated.append(avg_act_magnitudes[avg_act_magnitudes > 0])
 
-# 	joint_ = torch.concat(aggregated).float()
-# 	qt = torch.quantile(joint_, prune_frac)
-# 	for (name, module) in model.named_modules():
-# 		if name.endswith('mlp'): # TODO -- ldery -- make some changes here
-# 			avg_act_magnitudes = info_cache[name]['in'][1] / info_cache[name]['in'][0]
-# 			mask_ = ((avg_act_magnitudes > qt)*1.0).half()
-# # 				if '31' in name:
-# 			print('[{}] - updated sparsity : '.format(name), mask_.mean())
-# 			module.layer_mask = mask_
+
+def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, set_compliment=False):
+	for k, (name, module) in module_map.items():
+		module.is_using_main = False
+		sampling_proba = all_sampling_proba[k]
+		if set_compliment:
+			assert module.temp_mask is not None
+			module.temp_mask = 1.0 - module.temp_mask
+		else:
+			mask = get_random_mask(module.intermediate_size, module.main_mask, sampling_proba, pfrac)
+			all_masks[k].append([mask])
+# 			all_masks[k].append([1.0 - mask])
+			module.temp_mask = torch.Tensor(mask).type(module.up_proj.weight.type())
+
+def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
+	init_set = np.ones((1, 1, intermediate_sz)) if main_mask is None else main_mask.cpu().numpy()
+	num_to_zero = int(pfrac * np.sum(init_set)) + 1
+	non_zero_idxs = np.squeeze(init_set).nonzero()[0]
+	new_proba = sampling_proba[non_zero_idxs]
+	new_proba = new_proba / np.sum(new_proba)
+	chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba)
+	init_set[:, :, chosen_idxs] = 0
+	return init_set
+
 def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=8, nsamples=128, mpi=100, pfrac=0.1):
 
-	def get_random_mask(intermediate_sz, main_mask, sampling_proba):
-		init_set = np.ones((1, 1, intermediate_sz)) if main_mask is None else main_mask.cpu().numpy()
-		num_to_zero = int(pfrac * np.sum(init_set)) + 1
-		non_zero_idxs = np.squeeze(init_set).nonzero()[0]
-		new_proba = sampling_proba[non_zero_idxs]
-		new_proba = new_proba / np.sum(new_proba)
-		chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba)
-		init_set[:, :, chosen_idxs] = 0
-		return torch.Tensor(init_set)
-
-
-	def set_masks(module_map, all_masks, all_sampling_proba, set_compliment=False):
-		for k, (name, module) in module_map.items():
-			module.is_using_main = False
-			sampling_proba = all_sampling_proba[k]
-			if set_compliment:
-				assert module.temp_mask is not None
-				module.temp_mask = 1.0 - module.temp_mask
-			else:
-				mask = get_random_mask(module.intermediate_size, module.main_mask, sampling_proba)
-				all_masks[k].append([mask])
-				all_masks[k].append([1.0 - mask])
-				module.temp_mask = mask.type(module.up_proj.weight.type()).to(module.up_proj.weight.device).half()
+	# set to use main
+	for k, (name, module) in module_map.items():
+		module.is_using_main = False
 
 	all_masks = defaultdict(list)
 	seed_ = random.randint(0, 1e4)
-	for _ in range(mpi):
+	for iter_ in range(mpi):
 		# set the layer mask here
-		set_masks(module_map, all_masks, all_sampling_proba)
-		print(bsz, nsamples, seed_)
+		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
-		print(this_ppl)
-		pdb.set_trace()
-		for k, (name, module) in module_map.items():
-			all_masks[k][-2].append(this_ppl)
-		# set the compliment mask here
-		pdb.set_trace()
-		set_masks(module_map, all_masks, all_sampling_proba, set_compliment=True)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
+		print('Iter : ', iter_, ' PPL = ', this_ppl)
 		for k, (name, module) in module_map.items():
 			all_masks[k][-1].append(this_ppl)
+
+# 		# set the compliment mask here
+# 		set_masks(module_map, all_masks, all_sampling_proba, set_compliment=True, pfrac=pfrac)
+# 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
+# 		print(this_ppl)
+# 		for k, (name, module) in module_map.items():
+# 			all_masks[k][-1].append(this_ppl)
 
 	# reset to use main
 	for k, (name, module) in module_map.items():
@@ -131,13 +117,16 @@ def investigate_rms_fix(model_name, model, bsz=10, nsamples=64, masks_per_iter=1
 
 		mask_ = ((avg_act_magnitudes > qt)*1.0).half()
 		if module.main_mask is not None:
-			module.main_mask[module.main_mask > 0] = mask_
+			module.main_mask *= mask_
 		else:
 			module.main_mask = mask_
 
-		sampling_proba = 1.0 / (avg_act_magnitudes.cpu()).float().squeeze().numpy()
+		sampling_proba = avg_act_magnitudes.cpu().float().squeeze().numpy()
+		sampling_proba = 1.0 / (sampling_proba + (sampling_proba[sampling_proba > 0]).min()*0.1)
 		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
 		sampling_proba /= np.sum(sampling_proba)
+		if np.isnan(sampling_proba).any():
+			pdb.set_trace()
 		return module.main_mask.mean().item(), sampling_proba
 
 	def compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba):
@@ -171,7 +160,7 @@ def investigate_rms_fix(model_name, model, bsz=10, nsamples=64, masks_per_iter=1
 	tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 # 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
 # 	print('[Wikitext][Before] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(train_ppl, test_ppl))
-	
+
 	eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
@@ -179,20 +168,18 @@ def investigate_rms_fix(model_name, model, bsz=10, nsamples=64, masks_per_iter=1
 
 	n_iter = int(np.floor(np.log(target)/ np.log(1 - prune_frac))) - 1
 	for i in range(n_iter):
-		print('Here')
 		score_info = get_random_mask_scores(
 							model, tokenizer, module_map, all_sampling_proba,
 							bsz=bsz, nsamples=nsamples,
 							mpi=masks_per_iter, pfrac=prune_frac
 		)
-		print('There')
 		# Need to do some fitting to a linear model here.
 		compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples)
 		print('[{}] Achieved train ppl: '.format(i), this_ppl)
 	
 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
-	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(train_ppl, test_ppl))
+	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
 
 	for handle in hook_handles:
 		handle.remove()
@@ -210,7 +197,7 @@ def main():
 	parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
 	parser.add_argument('--save', type=str, default=None, help='Path to save results.')
 	parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
-	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
+	parser.add_argument('--masks_per_iter', type=int, default=50, help='How many masks to generate per-iteration')
 	args = parser.parse_args()
 
 	# Setting seeds for reproducibility

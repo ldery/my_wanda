@@ -9,10 +9,13 @@ from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablat
 # from lib.modelling_llama import LlamaForCausalLM
 from lib.modelling_llama_mod import LlamaForCausalLM
 # from lib.my_prune import my_check_sparsity, my_method_prune
-from lib.eval import eval_ppl, eval_ppl_trainonly
+from lib.eval import eval_ppl, eval_ppl_trainonly, train_wikitext
+import gc
+
 from collections import defaultdict
 import pickle as pkl
 import random
+from transformers.pytorch_utils import  prune_linear_layer
 from lib.scoring_model import ScoreModel
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -168,13 +171,14 @@ def investigate_rms_fix(model_name, model, bsz=14, nsamples=14, masks_per_iter=2
 			intermediate_sz = module.intermediate_size
 
 	print('We are using this reg weight : ', reg_weight)
-	prune_frac = 0.1
-	target = 0.5
+	prune_frac = 0.95
+	target = 0.05
 	tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 	eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
-	compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, None)
+	score_model_maps = None
+	compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, score_model_maps)
 
 	n_iter = int(np.floor(np.log(target)/ np.log(1 - prune_frac))) - 1
 	for i in range(n_iter):
@@ -183,17 +187,48 @@ def investigate_rms_fix(model_name, model, bsz=14, nsamples=14, masks_per_iter=2
 							bsz=bsz, nsamples=nsamples,
 							mpi=masks_per_iter, pfrac=prune_frac
 		)
-		score_model_maps = get_score_models(score_info, module_map, info_cache, reg_weight=reg_weight)
+# 		score_model_maps = get_score_models(score_info, module_map, info_cache, reg_weight=reg_weight)
 		# Need to do some fitting to a linear model here.
 		compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, score_model_maps)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples)
 		print('[{}] Achieved train ppl: '.format(i), this_ppl)
+
+# 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+# 	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+
+	# Print out the parameters
+	num_params = sum([p.numel() for p in model.parameters()])
+
+	# We want to perform pruning here !
+	for m_id, (name, module) in module_map.items():
+		index = module.main_mask.squeeze().nonzero().squeeze()
+		new_gate_proj = (prune_linear_layer(module.gate_proj, index)).half()
+		module.gate_proj = None
+		module.gate_proj = new_gate_proj
+		new_up_proj = (prune_linear_layer(module.up_proj, index)).half()
+		module.up_proj  = None
+		module.up_proj = new_up_proj
+		new_down_proj = (prune_linear_layer(module.down_proj, index, dim=1)).half()
+		module.down_proj = None
+		module.down_proj = new_down_proj
+		module.pre_prune = False
+		module.main_mask = None
+		module.temp_mask = None
+		module.intermed_cache = None
+
+	for hook in hook_handles:
+		hook.remove()
+	torch.cuda.empty_cache()
+	updated_numparams = sum([p.numel() for p in model.parameters()])
+	print('Og Params = {:.3f}'.format(num_params / 1e9), 'Updated Params = {:.3f}'.format(updated_numparams / 1e9))
 	
 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
-	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+	print('[Wikitext][Post-Pruning] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
 
 	for handle in hook_handles:
 		handle.remove()
+
+	info_cache.clear()
 
 
 def main():
@@ -210,6 +245,7 @@ def main():
 	parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	parser.add_argument('--reg_weight', type=float, default=0.0, help='reg-weight to use')
+	parser.add_argument('--ft_lr', type=float, default=5e-5, help='finetuning learning rate')
 	args = parser.parse_args()
 
 	# Setting seeds for reproducibility
@@ -222,7 +258,14 @@ def main():
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	investigate_rms_fix(args.model, model, nsamples=args.nsamples, masks_per_iter=args.masks_per_iter, reg_weight=args.reg_weight)
-	print('Done and exitting')
+	print('Done Prunining -- Now FineTuning')
+	gc.collect()
+	torch.cuda.empty_cache()
+	model.train()
+	_, final_test_ppl = train_wikitext(model, tokenizer, device=model.device, lr_=args.ft_lr)
+	print('[Wikitext][Post-FT] Test PPL = {:.3f}'.format(final_test_ppl))
+	
+	
 # 	investigate_model(args.model, model)
 # 	print('Done and exitting')
 # 	device = torch.device("cuda:0")

@@ -258,10 +258,10 @@ class LlamaMLP(nn.Module):
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
 		if self.is_using_main and (self.main_mask is not None):
 			frac_active = self.main_mask.mean().item()
-			intermed_result = intermed_result * (self.main_mask / frac_active)
+			intermed_result = intermed_result * (self.main_mask) # / frac_active)
 		elif (self.temp_mask is not None):
 			frac_active = self.temp_mask.mean().item()
-			intermed_result = intermed_result * (self.temp_mask / frac_active)
+			intermed_result = intermed_result * (self.temp_mask) # / frac_active)
 
 		assert self.intermed_cache is None
 		last_dim = intermed_result.shape[-1]

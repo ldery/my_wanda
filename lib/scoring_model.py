@@ -259,13 +259,7 @@ class ScoreModel(nn.Module):
 			base_coef_det = kendalltau(ts_ys, base_pred)
 			print('Our KendallTau = ', best_tau, ' | Naive Mean KendallTau = ', base_coef_det.correlation)
 			if self.wandb is not None:
-				self.wandb.log({
-					'{}/best_kt'.format(self.id_): {'ours': best_tau, 'naive': base_coef_det.correlation},
-					'{}/modelStats'.format(self.id_): {'min': self.base_model.score_tensor.min().item(), 'max': self.base_model.score_tensor.max().item()}
-				})
-				self.wandb.log(data=wandb_dict)
-				
-				fig, ax = plt.subplots(2, 2)
+				fig, ax = plt.subplots(2, 2, figsize=(10, 10))
 				for k, v in wandb_dict.items():
 					if 'loss_avg' in k:
 						ax[0][0].plot(v, label=k)
@@ -279,7 +273,18 @@ class ScoreModel(nn.Module):
 				ax[0][1].legend()
 				ax[1][0].legend()
 				ax[1][1].legend()
+				fig.suptitle('Our Tau = {} | Naive Tau = {}'.format(best_tau, base_coef_det.correlation))
 				self.wandb.log({"{}_chart".format(self.id_): fig})
+
+				plt.clf()
+				fig, ax = plt.subplots()
+				fig.suptitle('Histogram of Learned Index Weights')
+				data = self.base_model.score_tensor.cpu().numpy()
+				ax.hist(data, bins=np.logspace(np.log10(min(data)), np.log10(max(data)), 30), log=True)
+				ax.set_xlabel('Value')
+				ax.set_ylabel('Frequency (log scale)')
+				self.wandb.log({"{}_weight-histogram".format(self.id_): fig})
+
 
 
 

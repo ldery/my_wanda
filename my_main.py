@@ -257,7 +257,7 @@ def main():
 	parser.add_argument('--sm_reg_weight', type=float, default=0.0, help='reg-weight to use')
 	parser.add_argument('--sm_lr', type=float, default=5e-4, help='lr to use for fitting linear model')
 	parser.add_argument('--sm_bsz', type=int, default=256, help='batch size for fitting linear model')
-	parser.add_argument('--sm_nepochs', type=int, default=30, help='number of epochs to use to fit the linear model')
+	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')

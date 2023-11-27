@@ -12,6 +12,7 @@ import gc
 
 def wikitext_train_epoch(model, trainloader, optimizer, device=torch.device("cuda:0"), bs=8):
 	trainloader = trainloader.input_ids
+	# TODO (ldery) -- fix the number of samples
 	nsamples = 20 #trainloader.shape[-1]
 	train_losses = []
 	print('This is the model sequence length: ', model.seqlen)

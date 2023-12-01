@@ -28,9 +28,9 @@ def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1):
 	for k, (name, module) in module_map.items():
 		module.is_using_main = False
 		sampling_proba = all_sampling_proba[k]
-		mask = get_random_mask(module.intermediate_size, module.main_mask, sampling_proba, pfrac)
+		mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, pfrac)
 		all_masks[k].append(torch.Tensor(mask).squeeze())
-		module.temp_mask = torch.Tensor(mask).type(module.up_proj.weight.type())
+		module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
 
 def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set = np.ones((1, 1, intermediate_sz)) if main_mask is None else main_mask.cpu().numpy()
@@ -79,9 +79,6 @@ def get_llm(model_name, cache_dir="llm_weights"):
 
 def hook_fn(module_name, info_cache):
 	def hook(module, in_, out_):
-		if isinstance(in_, tuple):
-			in_ = in_[0]
-
 		flat_in = module.intermed_cache
 		module.intermed_cache = None
 		if 'in' not in info_cache[module_name]:
@@ -97,7 +94,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 	score_map = {}
 	for id_, (name, module) in module_map.items():
 		# Get a score map
-		print('Working on layer ', id_)
+		print('Working on layer ', name)
 		base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
 		base_mask = (base_mask.squeeze().float() * module.main_mask.squeeze().float()).view(-1, 1)
 		base_mask = base_mask / base_mask.sum()
@@ -151,19 +148,18 @@ def investigate_rms_fix(args, model, wandb_run):
 		for k, v in info_cache.items():
 			info_cache[k] = dict()
 
-
 	# add forward hooks
 	info_cache, hook_handles = defaultdict(dict), []
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
-		if name.endswith('mlp'):
+		if name.endswith('mlp') or name.endswith('self_attn'):
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
 
 	module_map = {}
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
-		if name.endswith('mlp'):
-			id_  = int(name.split('.')[2])
+		if name.endswith('mlp') or name.endswith('self_attn'):
+			id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
 			module_map[id_] = (name, module)
 			intermediate_sz = module.intermediate_size
 
@@ -220,7 +216,6 @@ def args_to_dict(args):
 		'LinModel.regweight': args.sm_reg_weight,
 		'LinModel.lr': args.sm_lr,
 		'LinModel.bsz': args.sm_bsz,
-		
 	}
 
 def args_to_str(args):
@@ -239,7 +234,7 @@ def get_linearmodel_hpdict(args):
 
 def main():
 	parser = argparse.ArgumentParser()
-	parser.add_argument('--model', type=str, default='decapoda-research/llama-7b-hf', help='LLaMA model')
+	parser.add_argument('--model', type=str, default='huggyllama/llama-7b', help='LLaMA model')
 	parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
 	parser.add_argument('--nsamples', type=int, default=14, help='Number of calibration samples.')
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')

@@ -163,6 +163,13 @@ class LlamaAttention(nn.Module):
 		self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 		self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
+		self.main_mask = None
+		self.temp_mask = None
+		self.is_using_main = True
+		self.intermed_cache = None
+		self.intermediate_size = self.num_heads
+
+
 	def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
 		return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
@@ -222,6 +229,14 @@ class LlamaAttention(nn.Module):
 			)
 
 		attn_output = attn_output.transpose(1, 2)
+		if self.is_using_main and (self.main_mask is not None):
+			attn_output = attn_output * self.main_mask
+		elif (self.temp_mask is not None):
+			attn_output = attn_output * self.temp_mask
+
+		assert self.intermed_cache is None
+		self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
+
 		attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
 		attn_output = self.o_proj(attn_output)
@@ -250,18 +265,16 @@ class LlamaMLP(nn.Module):
 		self.layer_id = layer_id
 		self.main_mask = None
 		self.temp_mask = None
-		self.prev_round_magnitudes = None
 		self.is_using_main = True
 		self.intermed_cache = None
 
 	def forward(self, x):
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+		# TODO [ldery] -- work on a better normalization factor (might be more necessary for Mistral model)
 		if self.is_using_main and (self.main_mask is not None):
-			frac_active = self.main_mask.mean().item()
-			intermed_result = intermed_result * (self.main_mask) # / frac_active)
+			intermed_result = intermed_result * self.main_mask
 		elif (self.temp_mask is not None):
-			frac_active = self.temp_mask.mean().item()
-			intermed_result = intermed_result * (self.temp_mask) # / frac_active)
+			intermed_result = intermed_result * self.temp_mask
 
 		assert self.intermed_cache is None
 		last_dim = intermed_result.shape[-1]

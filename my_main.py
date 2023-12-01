@@ -13,7 +13,7 @@ from lib.modelling_llama_mod import LlamaForCausalLM
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly, train_wikitext
 import gc
-from peft import inject_adapter_in_model, LoraConfig
+from peft import inject_adapter_in_model, LoraConfig, get_peft_model
 
 from collections import defaultdict
 import pickle as pkl
@@ -70,7 +70,6 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 	return all_masks, all_perfs
 
 def get_llm(model_name, cache_dir="llm_weights"):
-	pdb.set_trace()
 	model = LlamaForCausalLM.from_pretrained(
 		model_name, 
 		torch_dtype=torch.float16, 
@@ -215,9 +214,9 @@ def investigate_rms_fix(args, model, wandb_run):
 	with open(save_loc, 'wb') as handle:
 		pkl.dump(mask_info, handle)
 
-def prune_model(args, model):
+def prune_model(args, model, tokenizer):
 	# Print out the parameters
-	num_params = sum([p.numel() for p in model.parameters()])
+	num_params = sum([p.numel() for n, p in model.named_parameters() if not any(x in n for x in ['embed', 'head'])])
 	
 	save_loc = os.path.join(args.save, 'mask_info.pkl')
 	with open(save_loc, 'rb') as handle:
@@ -241,10 +240,11 @@ def prune_model(args, model):
 		module.intermed_cache = None
 		module.pre_prune = False
 
-	gc.collect()
-	torch.cuda.empty_cache()
-	updated_numparams = sum([p.numel() for p in model.parameters()])
-	print('Sparsity = {:.3f} | [Original] NParams = {:.3f} | [Updated] NParams = {:.3f}'.format(1.0 - (updated_numparams / num_params), num_params / 1e9 , updated_numparams / 1e9))
+		gc.collect()
+		torch.cuda.empty_cache()
+
+	updated_numparams = sum([p.numel() for n, p in model.named_parameters() if not any(x in n for x in ['embed', 'head'])])
+	print('Sparsity = {:.3f} | [Original] NParams = {:.3f}B | [Updated] NParams = {:.3f}B'.format(1.0 - (updated_numparams / num_params), num_params / 1e9 , updated_numparams / 1e9))
 
 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
 	print('[Wikitext][Post-Pruning] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
@@ -279,7 +279,7 @@ def get_linearmodel_hpdict(args):
 
 def main():
 	parser = argparse.ArgumentParser()
-	parser.add_argument('--model', type=str, default='decapoda-research/llama-7b-hf', help='LLaMA model')
+	parser.add_argument('--model', type=str, default='huggyllama/llama-7b', help='LLaMA model')
 	parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
 	parser.add_argument('--nsamples', type=int, default=14, help='Number of calibration samples.')
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
@@ -301,9 +301,14 @@ def main():
 	
 	# For when doing only FT
 	parser.add_argument('--ft_only', action="store_true", help="Doing only finetuning. Assumes that the saved pruned model info has been cached in the save file.")
-	parser.add_argument('--lora_rank', type=int, default=8, help="Rank to use for LoRa")
+	parser.add_argument('--ft_lr', type=float, default=1e-4, help="Learning rate for fine-tuning")
+	parser.add_argument('--ft_bsz', type=int, default=1, help="Batch size for finetuning")
+	parser.add_argument('--ft_grad_accum', type=int, default=32, help="grad accumulation steps for finetuning")
+	parser.add_argument('--ft_steps_per_epoch', type=int, default=50, help="steps for finetuning")
+
+	parser.add_argument('--lora_rank', type=int, default=16, help="Rank to use for LoRa")
 	parser.add_argument('--lora_dropout', type=float, default=0.1, help="dropout for lora modules")
-	parser.add_argument('--lora_modules_regex', type=str, default="linear", help="Regex to identify which modules to apply lora to")
+	parser.add_argument('--lora_modules_regex', type=str, default="down_proj", help="Regex to identify which modules to apply lora to. See https://github.com/huggingface/peft/blob/main/src/peft/utils/other.py#L512 for list")
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
 
@@ -333,10 +338,12 @@ def main():
 	if not args.ft_only:
 		investigate_rms_fix(args, model, wandb_run)
 
-	prune_model(args, model)
+	prune_model(args, model, tokenizer)
+	wandb_run.log({'loraRank': args.lora_rank})
+
 	# Prep the model for LoRA
 	lora_config = LoraConfig(
-		lora_alpha=16,  # suggested fixed value from the original LoRA paper. alpha/rank gives how much to weight the lora component.
+		lora_alpha=args.lora_rank*2,  # suggested fixed value from the original LoRA paper. alpha/rank gives how much to weight the lora component.
 		lora_dropout=args.lora_dropout,
 		r=args.lora_rank,
 		bias="none",
@@ -345,8 +352,22 @@ def main():
 
 	model = get_peft_model(model, lora_config)
 	model.print_trainable_parameters()
-	pdb.set_trace()
-	_, final_test_ppl = train_wikitext(model, tokenizer, device=model.device, lr_=args.ft_lr)
+
+	trainable_params = []
+	for _, param in model.named_parameters():
+		if param.requires_grad:
+			trainable_params.append(param)
+	
+	training_hp = {
+		'lr': args.ft_lr,
+		'bsz': args.ft_bsz,
+		'grad_accum_steps': args.ft_grad_accum,
+		'ft_steps': args.ft_steps_per_epoch
+	}
+
+	gc.collect()
+	torch.cuda.empty_cache()
+	_, final_test_ppl = train_wikitext(model, tokenizer, trainable_params, training_hp, wandb=wandb_run, device=model.device)
 	print('[Wikitext][Post-FT] Test PPL = {:.3f}'.format(final_test_ppl))
 
 

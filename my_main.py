@@ -15,7 +15,7 @@ from lib.eval import eval_ppl, eval_ppl_trainonly
 from collections import defaultdict
 import pickle as pkl
 import random
-from lib.scoring_model import ScoreModel
+from lib.scoring_model import ScoreModelHP
 import wandb
 
 print('torch', version('torch'))
@@ -24,11 +24,14 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 
-def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1):
+def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0):
 	for k, (name, module) in module_map.items():
+		if name.endswith('self_attn'):
+			this_pfrac = pfrac * mlp_attn_ratio
+
 		module.is_using_main = False
 		sampling_proba = all_sampling_proba[k]
-		mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, pfrac)
+		mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, this_pfrac)
 		all_masks[k].append(torch.Tensor(mask).squeeze())
 		module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
 
@@ -42,7 +45,7 @@ def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set[:, :, chosen_idxs] = 0
 	return init_set
 
-def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1):
+def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
 
 	# set to use main
 	for k, (name, module) in module_map.items():
@@ -52,7 +55,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 	seed_ = random.randint(0, 1e4)
 	for iter_ in range(mpi):
 		# set the layer mask here
-		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac)
+		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
 		print('Iter : ', iter_, ' PPL = ', this_ppl)
 		for k, (name, module) in module_map.items():
@@ -98,11 +101,14 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 		base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
 		base_mask = (base_mask.squeeze().float() * module.main_mask.squeeze().float()).view(-1, 1)
 		base_mask = base_mask / base_mask.sum()
-		sm = ScoreModel(id_='{}/{}'.format(parent_id, id_), num_players=module.intermediate_size, base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
-		sm.cuda()
+
+		sm_hp_searcher = ScoreModelHP(
+			id_='{}/{}'.format(parent_id, id_), num_players=module.intermediate_size,
+			base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
+
 		run_info = score_perfs[0][id_], score_perfs[1][id_]
-		sm.update_with_info(run_info)
-		score_map[id_] = (sm.base_model.score_tensor.clone()).squeeze().detach()
+		sm_hp_searcher.search_best_linear_fit(run_info)
+		score_map[id_] = sm_hp_searcher.get_best_fit()
 	return score_map
 
 
@@ -132,13 +138,16 @@ def investigate_rms_fix(args, model, wandb_run):
 			pdb.set_trace()
 		return module.main_mask.mean().item(), sampling_proba
 
-	def compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, score_model_maps):
+	def compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=1.0):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
+			if name.endswith('self_attn'):
+				this_prune_frac = prune_frac * mlp_attn_ratio
+
 			score_model = None if score_model_maps is None else score_model_maps[id_]
 			(this_avg, new_samp_prob) = update_mask_one_layer(
 											module, info_cache[name], 
-											score_matrix[id_],  prune_frac,
+											score_matrix[id_],  this_prune_frac,
 											score_model)
 			avgs += this_avg
 			all_sampling_proba[id_] = new_samp_prob
@@ -169,22 +178,23 @@ def investigate_rms_fix(args, model, wandb_run):
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
-	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, None)
+	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, None, mlp_attn_ratio=args.mlp_attn_ratio)
 
+	# TODO -- ldery -- modify this
 	n_iter = int(np.floor(np.log(args.sparsity_ratio)/ np.log(1 - args.prune_frac))) - 1
 	for i in range(n_iter):
 		start = time()
 		score_info = get_random_mask_scores(
 							model, tokenizer, module_map, all_sampling_proba,
 							bsz=args.bsz, nsamples=args.nsamples,
-							mpi=args.masks_per_iter, pfrac=args.prune_frac
+							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
 		)
 		score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(i))
 		gen_scores_time = time() - start
 		print('It took ', str(datetime.timedelta(seconds=gen_scores_time)), ' to complete score generation and linear model fit')
 		start = time()
 		# Need to do some fitting to a linear model here.
-		compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps)
+		compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=args.mlp_attn_ratio)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
 		time_delta = time() - start
 		
@@ -207,15 +217,19 @@ def investigate_rms_fix(args, model, wandb_run):
 		pkl.dump(mask_info, handle)
 
 def args_to_dict(args):
+	def stringify(x):
+		return '|'.join([str(y) for y in eval(x)])
+
 	return {
 		'nsamp': args.nsamples,
 		'sparsity': args.sparsity_ratio,
 		'prune_frac': args.prune_frac,
 		'bsz': args.bsz,
 		'masksperiter': args.masks_per_iter,
-		'LinModel.regweight': args.sm_reg_weight,
-		'LinModel.lr': args.sm_lr,
-		'LinModel.bsz': args.sm_bsz,
+		'mlp_attn_ratio': args.mlp_attn_ratio,
+		'LinModel.regweight': stringify(args.sm_reg_weight),
+		'LinModel.lr': stringify(args.sm_lr_factor),
+		'LinModel.bsz': stringify(args.sm_bsz),
 		'LinModel.nepochs': args.sm_nepochs,
 	}
 
@@ -225,11 +239,11 @@ def args_to_str(args):
 
 def get_linearmodel_hpdict(args):
 	base_hp = {
-		'lr' :args.sm_lr,
-		'reg_weight': args.sm_reg_weight,
-		'bsz' : args.sm_bsz,
-		'nepochs' : args.sm_nepochs,
-		'patience': 10,
+		'lr_factor' : eval(args.sm_lr_factor),
+		'reg_weight': eval(args.sm_reg_weight),
+		'bsz' : eval(args.sm_bsz),
+		'nepochs' : [args.sm_nepochs],
+		'patience': [10],
 	}
 	return base_hp
 
@@ -241,6 +255,7 @@ def main():
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
 	parser.add_argument('--prune_frac', type=float, default=0.1, help='Fraction of weights to prune at a time')
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
+	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
 
 	parser.add_argument("--prune_method", type=str, choices=["ours", "magnitude", "wanda", "sparsegpt", "ablate_magnitude", "ablate_wanda"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
@@ -250,9 +265,9 @@ def main():
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	
 	# Hyperparams for scoring model
-	parser.add_argument('--sm_reg_weight', type=float, default=0.0, help='reg-weight to use')
-	parser.add_argument('--sm_lr', type=float, default=5e-4, help='lr to use for fitting linear model')
-	parser.add_argument('--sm_bsz', type=int, default=256, help='batch size for fitting linear model')
+	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 0, 1e-4]', help='reg-weight to use')
+	parser.add_argument('--sm_lr_factor', type=str, default='[10, 1, 0.1]', help='lr factor to use for fitting linear model')
+	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	
 	# Wandb HP

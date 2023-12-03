@@ -216,6 +216,7 @@ def args_to_dict(args):
 		'LinModel.regweight': args.sm_reg_weight,
 		'LinModel.lr': args.sm_lr,
 		'LinModel.bsz': args.sm_bsz,
+		'LinModel.nepochs': args.sm_nepochs,
 	}
 
 def args_to_str(args):

@@ -201,7 +201,8 @@ class ScoreModel(nn.Module):
 			mean_score_tensor.requires_grad = False
 
 		# Setup the optimizer and learn the new model
-		self.score_optim = Adam(self.base_model.parameters(), lr=self.hp_dict['lr'])
+		lr = self.hp_dict['lr'] if self.hp_dict['lr'] > 0 else 1.0/(len(mean_score_tensor.nonzero()) * 10)
+		self.score_optim = Adam(self.base_model.parameters(), lr=lr)
 		lr_scheduler = ReduceLROnPlateau(self.score_optim, mode='max', factor=0.5, patience=3, min_lr=1e-5)
 
 		best_tau, clone, since_best, best_run = -1e5, None, 0, None

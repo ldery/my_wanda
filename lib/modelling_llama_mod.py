@@ -234,8 +234,8 @@ class LlamaAttention(nn.Module):
 		elif (self.temp_mask is not None):
 			attn_output = attn_output * self.temp_mask
 
-		assert self.intermed_cache is None
-		self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
+		with torch.no_grad():
+			self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
 
 		attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
@@ -276,9 +276,9 @@ class LlamaMLP(nn.Module):
 		elif (self.temp_mask is not None):
 			intermed_result = intermed_result * self.temp_mask
 
-		assert self.intermed_cache is None
 		last_dim = intermed_result.shape[-1]
-		self.intermed_cache = intermed_result.abs().view(-1, last_dim).mean(axis=0, keepdims=True).view(1, 1, -1)
+		with torch.no_grad():
+			self.intermed_cache = intermed_result.abs().view(-1, last_dim).mean(axis=0, keepdims=True).view(1, 1, -1)
 		return self.down_proj(intermed_result)
 
 

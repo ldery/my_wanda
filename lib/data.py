@@ -4,6 +4,8 @@ import numpy as np
 import random
 import torch
 from datasets import load_dataset
+from datasets.utils import disable_progress_bar
+disable_progress_bar()
 
 # Set seed for reproducibility
 def set_seed(seed):

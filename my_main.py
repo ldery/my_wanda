@@ -17,6 +17,8 @@ import pickle as pkl
 import random
 from lib.scoring_model import ScoreModelHP
 import wandb
+from transformers.pytorch_utils import  find_pruneable_heads_and_indices, prune_linear_layer
+import gc
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -97,7 +99,6 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 	score_map = {}
 	for id_, (name, module) in module_map.items():
 		# Get a score map
-		print('Working on layer ', name)
 		base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
 		base_mask = (base_mask.squeeze().float() * module.main_mask.squeeze().float()).view(-1, 1)
 		base_mask = base_mask / base_mask.sum()
@@ -111,8 +112,18 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 		score_map[id_] = sm_hp_searcher.get_best_fit()
 	return score_map
 
+def run_data_to_sampling_proba(info, module):
+	avg_act_magnitudes = info['in'][1] / info['in'][0]
+	sampling_proba = avg_act_magnitudes.cpu().float().squeeze().numpy()
+	sampling_proba = sampling_proba.max() - sampling_proba
+	if module.main_mask is not None:
+		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
+	sampling_proba /= np.sum(sampling_proba)
+	if np.isnan(sampling_proba).any():
+		pdb.set_trace()
+	return sampling_proba
 
-def investigate_rms_fix(args, model, wandb_run):
+def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 	def update_mask_one_layer(module, info, score_info, prune_frac, score_model_weights):
 		if score_model_weights is None:
@@ -129,18 +140,13 @@ def investigate_rms_fix(args, model, wandb_run):
 		else:
 			module.main_mask = (mask_).view(info['in'][1].shape)
 
-		avg_act_magnitudes = info['in'][1] / info['in'][0]
-		sampling_proba = avg_act_magnitudes.cpu().float().squeeze().numpy()
-		sampling_proba = sampling_proba.max() - sampling_proba
-		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
-		sampling_proba /= np.sum(sampling_proba)
-		if np.isnan(sampling_proba).any():
-			pdb.set_trace()
+		sampling_proba = run_data_to_sampling_proba(info, module)
 		return module.main_mask.mean().item(), sampling_proba
 
 	def compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=1.0):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
+			this_prune_frac = prune_frac
 			if name.endswith('self_attn'):
 				this_prune_frac = prune_frac * mlp_attn_ratio
 
@@ -151,7 +157,6 @@ def investigate_rms_fix(args, model, wandb_run):
 											score_model)
 			avgs += this_avg
 			all_sampling_proba[id_] = new_samp_prob
-		print('The new occupacy is : {:.3f}'.format(avgs / len(module_map)))
 
 		# Clear the info-cache for the next round !
 		for k, v in info_cache.items():
@@ -172,49 +177,39 @@ def investigate_rms_fix(args, model, wandb_run):
 			module_map[id_] = (name, module)
 			intermediate_sz = module.intermediate_size
 
+	# Initial setup to get the initial probability distribution for sampling
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
-	
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
-	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, None, mlp_attn_ratio=args.mlp_attn_ratio)
+	for id_, (name, module) in module_map.items():
+		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module)
+		module.main_mask = torch.ones_like(info_cache[name]['in'][1])
 
-	# TODO -- ldery -- modify this
-	n_iter = int(np.floor(np.log(args.sparsity_ratio)/ np.log(1 - args.prune_frac))) - 1
-	for i in range(n_iter):
-		start = time()
-		score_info = get_random_mask_scores(
-							model, tokenizer, module_map, all_sampling_proba,
-							bsz=args.bsz, nsamples=args.nsamples,
-							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
-		)
-		score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(i))
-		gen_scores_time = time() - start
-		print('It took ', str(datetime.timedelta(seconds=gen_scores_time)), ' to complete score generation and linear model fit')
-		start = time()
-		# Need to do some fitting to a linear model here.
-		compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=args.mlp_attn_ratio)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
-		time_delta = time() - start
-		
-		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta, 'Pruning/trainPPL': this_ppl})
-		print('It took ', str(datetime.timedelta(seconds=time_delta)), ' to complete mask updated and eval of updated model')
-		print('[Iter = {}] Took : {} | Achieved train ppl: '.format(i, str(datetime.timedelta(seconds=(time_delta + gen_scores_time)))), this_ppl, flush=True)
-		print('===='*20)
-	
-	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
-	wandb_run.log({'Final/TrainPPL': ppl_train, 'Final/TestPPL': ppl_test})
-	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+	# Clear the info-cache for the next round !
+	for k, v in info_cache.items():
+		info_cache[k] = dict()
+
+	start = time()
+	score_info = get_random_mask_scores(
+						model, tokenizer, module_map, all_sampling_proba,
+						bsz=args.bsz, nsamples=args.nsamples,
+						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
+	)
+	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(epoch_))
+	gen_scores_time = time() - start
+	start = time()
+	# Need to do some fitting to a linear model here.
+	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=args.mlp_attn_ratio)
+	time_delta = time() - start
+	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
+	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
 
 	for handle in hook_handles:
 		handle.remove()
 
-	# Now save all the required information
-	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
-	save_loc = os.path.join(args.save, 'mask_info.pkl')
-	with open(save_loc, 'wb') as handle:
-		pkl.dump(mask_info, handle)
+	return mask_info
 
 def args_to_dict(args):
 	def stringify(x):
@@ -225,6 +220,7 @@ def args_to_dict(args):
 		'sparsity': args.sparsity_ratio,
 		'prune_frac': args.prune_frac,
 		'bsz': args.bsz,
+		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'masksperiter': args.masks_per_iter,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'LinModel.regweight': stringify(args.sm_reg_weight),
@@ -247,9 +243,83 @@ def get_linearmodel_hpdict(args):
 	}
 	return base_hp
 
+def get_param_count(model, exclude=['embed', 'head']):
+	return sum([p.numel() for n, p in model.named_parameters() if not any(x in n for x in exclude)])
+
+def prune_mlp(mask_, module):
+	index = mask_.squeeze().nonzero().squeeze()
+	new_gate_proj = (prune_linear_layer(module.gate_proj, index)).half()
+	module.gate_proj = None
+	module.gate_proj = new_gate_proj
+	new_up_proj = (prune_linear_layer(module.up_proj, index)).half()
+	module.up_proj  = None
+	module.up_proj = new_up_proj
+	new_down_proj = (prune_linear_layer(module.down_proj, index, dim=1)).half()
+	module.down_proj = None
+	module.down_proj = new_down_proj
+	module.main_mask = None
+	module.temp_mask = None
+	module.intermed_cache = None
+	module.intermediate_size = len(index)
+
+	gc.collect()
+	torch.cuda.empty_cache()
+
+def prune_attn(mask_, module):
+	index = (mask_.squeeze() == 0).nonzero().squeeze()
+	_, updated_indices = find_pruneable_heads_and_indices(
+		index, module.num_heads, module.head_dim, set()
+	)
+
+	new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
+	module.q_proj = None
+	module.q_proj = new_q_proj
+	
+	new_k_proj = (prune_linear_layer(module.k_proj, updated_indices)).half()
+	module.k_proj = None
+	module.k_proj = new_k_proj
+
+	new_v_proj = (prune_linear_layer(module.v_proj, updated_indices)).half()
+	module.v_proj = None
+	module.v_proj = new_v_proj
+
+	new_o_proj = (prune_linear_layer(module.o_proj, updated_indices, dim=1)).half()
+	module.o_proj = None
+	module.o_proj = new_o_proj
+
+	module.num_heads = len(mask_.squeeze().nonzero())
+	module.hidden_size = module.num_heads * module.head_dim
+
+	module.main_mask = None
+	module.temp_mask = None
+	module.intermed_cache = None
+	module.intermediate_size = module.num_heads
+
+	gc.collect()
+	torch.cuda.empty_cache() 
+
+
+def prune_model(args, model, mask_info, tokenizer):
+	before_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+	for (name, module) in model.named_modules():
+		if name not in mask_info: continue # We are not pruning this
+
+		mask_ = mask_info[name]
+		if name.endswith('mlp'):
+			prune_mlp(mask_, module)
+		elif name.endswith('self_attn'):
+			prune_attn(mask_, module)
+		else:
+			raise ValueError("Invalid type found in mask_info : {}".format(name))
+
+	after_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+	print('Before Pruning Tr-ppl = {:.3f} | After Pruning Tr-ppl = {:.3f}'.format(before_ppl, after_ppl))
+	assert np.isclose(before_ppl, after_ppl), 'Pruning might have been done improperly -- large gap between before and after PPL'
+
+
 def main():
 	parser = argparse.ArgumentParser()
-	parser.add_argument('--model', type=str, default='huggyllama/llama-7b', help='LLaMA model')
+	parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf', help='LLaMA model') # huggyllama/llama-7b
 	parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
 	parser.add_argument('--nsamples', type=int, default=14, help='Number of calibration samples.')
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
@@ -295,11 +365,71 @@ def main():
 	model = get_llm(args.model, args.cache_dir)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-	investigate_rms_fix(args, model, wandb_run)
+
+	origina_param_count = get_param_count(model)
+	cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
+	epoch_ = 1
+	while cur_sparsity < args.sparsity_ratio:
+		print('Gathering statistics for pruning')
+		mask_info = investigate_score_based_mask(args, model, wandb_run, epoch_=epoch_)
+		print('Prune model')
+		prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
+		cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
+
+		# Evaluate the performance of the pruned model
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+
+		wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
+		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
+		epoch_ += 1
+
+	wandb_run.log({'sparsity': cur_sparsity})
+	torch.save(model.state_dict(), args.save)
 	print('Done and exitting')
+
+
 
 
 if __name__ == '__main__':
     main()
 
 
+
+# 	# TODO -- ldery -- adjust this and below !
+# 	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, None, mlp_attn_ratio=args.mlp_attn_ratio)
+
+# 	# TODO -- ldery -- modify this
+# 	n_iter = int(np.floor(np.log(args.sparsity_ratio)/ np.log(1 - args.prune_frac))) - 1
+# 	for i in range(n_iter):
+# 		start = time()
+# 		score_info = get_random_mask_scores(
+# 							model, tokenizer, module_map, all_sampling_proba,
+# 							bsz=args.bsz, nsamples=args.nsamples,
+# 							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
+# 		)
+# 		score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(i))
+# 		gen_scores_time = time() - start
+# 		print('It took ', str(datetime.timedelta(seconds=gen_scores_time)), ' to complete score generation and linear model fit')
+# 		start = time()
+# 		# Need to do some fitting to a linear model here.
+# 		compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=args.mlp_attn_ratio)
+# 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+# 		time_delta = time() - start
+		
+# 		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta, 'Pruning/trainPPL': this_ppl})
+# 		print('It took ', str(datetime.timedelta(seconds=time_delta)), ' to complete mask updated and eval of updated model')
+# 		print('[Iter = {}] Took : {} | Achieved train ppl: '.format(i, str(datetime.timedelta(seconds=(time_delta + gen_scores_time)))), this_ppl, flush=True)
+# 		print('===='*20)
+	
+# 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+# 	wandb_run.log({'Final/TrainPPL': ppl_train, 'Final/TestPPL': ppl_test})
+# 	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+
+# 	for handle in hook_handles:
+# 		handle.remove()
+
+# 	# Now save all the required information
+# 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
+# 	save_loc = os.path.join(args.save, 'mask_info.pkl')
+# 	with open(save_loc, 'wb') as handle:
+# 		pkl.dump(mask_info, handle)

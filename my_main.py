@@ -213,7 +213,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 def args_to_dict(args):
 	def stringify(x):
-		return '|'.join([str(y) for y in eval(x)])
+		return '-'.join([str(y) for y in eval(x)])
 
 	return {
 		'nsamp': args.nsamples,
@@ -336,7 +336,7 @@ def main():
 	
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 0, 1e-4]', help='reg-weight to use')
-	parser.add_argument('--sm_lr_factor', type=str, default='[10, 1, 0.1]', help='lr factor to use for fitting linear model')
+	parser.add_argument('--sm_lr_factor', type=str, default='[100, 10, 1, 0.1]', help='lr factor to use for fitting linear model')
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	
@@ -372,6 +372,12 @@ def main():
 	while cur_sparsity < args.sparsity_ratio:
 		print('Gathering statistics for pruning')
 		mask_info = investigate_score_based_mask(args, model, wandb_run, epoch_=epoch_)
+
+		# Save the mask info for the epoch
+		save_loc = os.path.join(args.save, 'mask_info_{}.pkl'.format(epoch_))
+		with open(save_loc, 'wb') as handle:
+			pkl.dump(mask_info, handle)
+
 		print('Prune model')
 		prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
 		cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
@@ -381,10 +387,10 @@ def main():
 
 		wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
 		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
+
 		epoch_ += 1
 
 	wandb_run.log({'sparsity': cur_sparsity})
-	torch.save(model.state_dict(), args.save)
 	print('Done and exitting')
 
 

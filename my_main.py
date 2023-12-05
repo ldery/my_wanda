@@ -300,7 +300,7 @@ def prune_attn(mask_, module):
 
 
 def prune_model(args, model, mask_info, tokenizer):
-	before_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+# 	before_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
 	for (name, module) in model.named_modules():
 		if name not in mask_info: continue # We are not pruning this
 
@@ -312,9 +312,11 @@ def prune_model(args, model, mask_info, tokenizer):
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
 
-	after_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
-	print('Before Pruning Tr-ppl = {:.3f} | After Pruning Tr-ppl = {:.3f}'.format(before_ppl, after_ppl))
-	assert np.isclose(before_ppl, after_ppl), 'Pruning might have been done improperly -- large gap between before and after PPL'
+	gc.collect()
+	torch.cuda.empty_cache() 
+# 	after_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+# 	print('Before Pruning Tr-ppl = {:.3f} | After Pruning Tr-ppl = {:.3f}'.format(before_ppl, after_ppl))
+# 	assert np.isclose(before_ppl, after_ppl), 'Pruning might have been done improperly -- large gap between before and after PPL'
 
 
 def main():

@@ -120,7 +120,13 @@ def run_data_to_sampling_proba(info, module):
 		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
 	sampling_proba /= np.sum(sampling_proba)
 	if np.isnan(sampling_proba).any():
-		pdb.set_trace()
+		# do some logging and also checking here to fix.
+		print('[NaN issue] We encounted a NaN', sampling_proba)
+		sampling_proba = np.nan_to_num(sampling_proba, nan=0)
+		if sum(sampling_proba) == 0:
+			print('[NaN issue] all vales are zero after reset. Using the uniform dist instead')
+			sampling_proba += 1.0
+		sampling_proba /= np.sum(sampling_proba)
 	return sampling_proba
 
 def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
@@ -267,6 +273,11 @@ def prune_mlp(mask_, module):
 
 def prune_attn(mask_, module):
 	index = (mask_.squeeze() == 0).nonzero().squeeze()
+
+	if len(index) == 0:
+		# we are not pruning anything here
+		return
+
 	_, updated_indices = find_pruneable_heads_and_indices(
 		index, module.num_heads, module.head_dim, set()
 	)

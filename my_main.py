@@ -275,13 +275,14 @@ def prune_mlp(mask_, module):
 def prune_attn(mask_, module):
 	index = (mask_.squeeze() == 0).nonzero().squeeze()
 
-	if len(index) == 0:
-		# we are not pruning anything here
-		return
+	if index.numel() < 2:
+		if index.numel() == 0: return # we are not pruning anything here
+		index = [index]
 
 	_, updated_indices = find_pruneable_heads_and_indices(
 		index, module.num_heads, module.head_dim, set()
 	)
+
 
 	new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
 	module.q_proj = None
@@ -385,12 +386,16 @@ def main():
 	epoch_ = 1
 	while cur_sparsity < args.sparsity_ratio:
 		print('Gathering statistics for pruning')
-		mask_info = investigate_score_based_mask(args, model, wandb_run, epoch_=epoch_)
-
-		# Save the mask info for the epoch
 		save_loc = os.path.join(args.save, 'mask_info_{}.pkl'.format(epoch_))
-		with open(save_loc, 'wb') as handle:
-			pkl.dump(mask_info, handle)
+		if os.path.exists(save_loc):
+			print('Successfully loaded past pruning info')
+			with open(save_loc, 'rb') as handle:
+				mask_info = pkl.load(handle)
+		else:
+			mask_info = investigate_score_based_mask(args, model, wandb_run, epoch_=epoch_)
+			# Save the mask info for the epoch
+			with open(save_loc, 'wb') as handle:
+				pkl.dump(mask_info, handle)
 
 		print('Prune model')
 		prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)

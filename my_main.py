@@ -126,6 +126,7 @@ def run_data_to_sampling_proba(info, module):
 		if sum(sampling_proba) == 0:
 			print('[NaN issue] all vales are zero after reset. Using the uniform dist instead')
 			sampling_proba += 1.0
+			print('This is the original activation info : ', info['in'])
 		sampling_proba /= np.sum(sampling_proba)
 	return sampling_proba
 

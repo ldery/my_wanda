@@ -26,16 +26,27 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 
-def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0):
+def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
 	for k, (name, module) in module_map.items():
 		if name.endswith('self_attn'):
 			this_pfrac = pfrac * mlp_attn_ratio
 
 		module.is_using_main = False
-		sampling_proba = all_sampling_proba[k]
-		mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, this_pfrac)
-		all_masks[k].append(torch.Tensor(mask).squeeze())
-		module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
+		sampling_proba, fixed_indices = all_sampling_proba[k]
+		if use_complement:
+			module.temp_mask = 1 - module.temp_mask
+			module.temp_mask[:, :, fixed_indices] = 1.0
+
+			to_cache = module.temp_mask.cpu().squeeze()
+			to_cache[fixed_indices] = 0
+			all_masks[k].append(to_cache)
+		else:
+			mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, this_pfrac)
+			module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
+
+			to_cache = torch.Tensor(mask).squeeze()
+			to_cache[fixed_indices] = 0
+			all_masks[k].append(to_cache)
 
 def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set = np.ones((1, 1, intermediate_sz)) if main_mask is None else main_mask.cpu().numpy()
@@ -55,11 +66,19 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
 	seed_ = random.randint(0, 1e4)
-	for iter_ in range(mpi):
+	for iter_ in range(mpi // 2):
 		# set the layer mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
-		print('Iter : ', iter_, ' PPL = ', this_ppl)
+		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
+		for k, (name, module) in module_map.items():
+			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
+			all_perfs[k].append(-this_ppl)
+		
+		# set the complement mask here
+		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, use_complement=True)
+		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
+		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
@@ -112,55 +131,57 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 		score_map[id_] = sm_hp_searcher.get_best_fit()
 	return score_map
 
-def run_data_to_sampling_proba(info, module):
+def run_data_to_sampling_proba(info, module, pfrac):
 	avg_act_magnitudes = info['in'][1] / info['in'][0]
 	sampling_proba = avg_act_magnitudes.cpu().squeeze().numpy()
+
+	num_keep_static = int(len(sampling_proba)*(1.0 - 2*pfrac)) # hard coded to look at 2x the original pruning fraction
+	fixed_indices = np.argsort(-sampling_proba)[:num_keep_static]
+
 	sampling_proba = sampling_proba.max() - sampling_proba
+	sampling_proba[fixed_indices] = 0
+
 	if module.main_mask is not None:
 		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
 	sampling_proba /= np.sum(sampling_proba)
 	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
-	return sampling_proba
+	return sampling_proba, fixed_indices
 
 def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
-	def update_mask_one_layer(module, info, score_info, prune_frac, score_model_weights):
+	def update_mask_one_layer(module, info, score_info, prune_frac, score_model_weights, fixed_indices):
 		if score_model_weights is None:
 			score_model_weights = (info['in'][1] / info['in'][0]).squeeze()
 
+		# bias this so that we do not remove any of the fixed indices
+		score_model_weights[fixed_indices] = score_model_weights.max() + 1.0
 		if module.main_mask is not None:
 			qt = torch.quantile((score_model_weights[(module.main_mask).squeeze() > 0]).squeeze().float(), prune_frac)
 		else:
 			qt = torch.quantile(score_model_weights.squeeze().float(), prune_frac)
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
-		if mask_.sum() == 0:
-			print('We have encountered a zero sum. Need to fix. Skip Updating this layer')
-			sampling_proba = run_data_to_sampling_proba(info, module)
-			return module.main_mask.mean().item(), sampling_proba
-
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)
 		else:
 			module.main_mask = (mask_).view(info['in'][1].shape)
 
-		sampling_proba = run_data_to_sampling_proba(info, module)
-		return module.main_mask.mean().item(), sampling_proba
+		return module.main_mask.mean().item()
 
-	def compute_updated_masks_local(prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=1.0):
+	def compute_updated_masks_local(prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=1.0):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
 			this_prune_frac = prune_frac
 			if name.endswith('self_attn'):
 				this_prune_frac = prune_frac * mlp_attn_ratio
 
+			_, fixed_indices = all_sampling_proba[id_]
 			score_model = None if score_model_maps is None else score_model_maps[id_]
-			(this_avg, new_samp_prob) = update_mask_one_layer(
-											module, info_cache[name], 
-											score_matrix[id_],  this_prune_frac,
-											score_model)
+			this_avg = update_mask_one_layer(
+										module, info_cache[name], 
+										score_matrix[id_], this_prune_frac,
+										score_model, fixed_indices)
 			avgs += this_avg
-			all_sampling_proba[id_] = new_samp_prob
 
 		# Clear the info-cache for the next round !
 		for k, v in info_cache.items():
@@ -188,7 +209,10 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
 	for id_, (name, module) in module_map.items():
-		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module)
+		this_pfrac = args.prune_frac
+		if name.endswith('self_attn'):
+			this_pfrac = this_pfrac * args.mlp_attn_ratio
+		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
 
 	# Clear the info-cache for the next round !
@@ -205,7 +229,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	gen_scores_time = time() - start
 	start = time()
 	# Need to do some fitting to a linear model here.
-	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=args.mlp_attn_ratio)
+	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio)
 	time_delta = time() - start
 	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
@@ -375,9 +399,9 @@ def main():
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
-	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
-	original_runtime = time() - start_time
+# 	start_time = time()
+# 	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+# 	original_runtime = time() - start_time
 
 	origina_param_count = get_param_count(model)
 	cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)

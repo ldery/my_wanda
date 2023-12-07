@@ -84,7 +84,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
 
 def hook_fn(module_name, info_cache):
 	def hook(module, in_, out_):
-		flat_in = module.intermed_cache
+		flat_in = (module.intermed_cache).clone().detach().float()
 		module.intermed_cache = None
 		if 'in' not in info_cache[module_name]:
 			info_cache[module_name]['in'] = [1, flat_in]
@@ -100,7 +100,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 	for id_, (name, module) in module_map.items():
 		# Get a score map
 		base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
-		base_mask = (base_mask.squeeze().float() * module.main_mask.squeeze().float()).view(-1, 1)
+		base_mask = (base_mask.squeeze() * module.main_mask.squeeze().float()).view(-1, 1)
 		base_mask = base_mask / base_mask.sum()
 
 		sm_hp_searcher = ScoreModelHP(
@@ -114,20 +114,12 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 
 def run_data_to_sampling_proba(info, module):
 	avg_act_magnitudes = info['in'][1] / info['in'][0]
-	sampling_proba = avg_act_magnitudes.cpu().float().squeeze().numpy()
+	sampling_proba = avg_act_magnitudes.cpu().squeeze().numpy()
 	sampling_proba = sampling_proba.max() - sampling_proba
 	if module.main_mask is not None:
 		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
 	sampling_proba /= np.sum(sampling_proba)
-	if np.isnan(sampling_proba).any():
-		# do some logging and also checking here to fix.
-		print('[NaN issue] We encounted a NaN', sampling_proba)
-		sampling_proba = np.nan_to_num(sampling_proba, nan=0)
-		if sum(sampling_proba) == 0:
-			print('[NaN issue] all vales are zero after reset. Using the uniform dist instead')
-			sampling_proba += 1.0
-			print('This is the original activation info : ', info['in'])
-		sampling_proba /= np.sum(sampling_proba)
+	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
 	return sampling_proba
 
 def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
@@ -142,6 +134,11 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			qt = torch.quantile(score_model_weights.squeeze().float(), prune_frac)
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
+		if mask_.sum() == 0:
+			print('We have encountered a zero sum. Need to fix. Skip Updating this layer')
+			sampling_proba = run_data_to_sampling_proba(info, module)
+			return module.main_mask.mean().item(), sampling_proba
+
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)
 		else:
@@ -192,7 +189,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
 	for id_, (name, module) in module_map.items():
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module)
-		module.main_mask = torch.ones_like(info_cache[name]['in'][1])
+		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
 
 	# Clear the info-cache for the next round !
 	for k, v in info_cache.items():
@@ -313,7 +310,6 @@ def prune_attn(mask_, module):
 
 
 def prune_model(args, model, mask_info, tokenizer):
-# 	before_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
 	for (name, module) in model.named_modules():
 		if name not in mask_info: continue # We are not pruning this
 
@@ -327,9 +323,6 @@ def prune_model(args, model, mask_info, tokenizer):
 
 	gc.collect()
 	torch.cuda.empty_cache() 
-# 	after_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
-# 	print('Before Pruning Tr-ppl = {:.3f} | After Pruning Tr-ppl = {:.3f}'.format(before_ppl, after_ppl))
-# 	assert np.isclose(before_ppl, after_ppl), 'Pruning might have been done improperly -- large gap between before and after PPL'
 
 
 def main():
@@ -348,6 +341,7 @@ def main():
 	parser.add_argument('--save', type=str, default=None, help='Path to save results.')
 	parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
+	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
 	
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 0, 1e-4]', help='reg-weight to use')
@@ -380,11 +374,18 @@ def main():
 	model = get_llm(args.model, args.cache_dir)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+	
+	start_time = time()
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+	original_runtime = time() - start_time
 
 	origina_param_count = get_param_count(model)
 	cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
 	epoch_ = 1
-	while cur_sparsity < args.sparsity_ratio:
+	while True:
+		if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
+			break
+
 		print('Gathering statistics for pruning')
 		save_loc = os.path.join(args.save, 'mask_info_{}.pkl'.format(epoch_))
 		if os.path.exists(save_loc):
@@ -402,7 +403,13 @@ def main():
 		cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
 
 		# Evaluate the performance of the pruned model
+		start_time = time()
 		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+		pruned_model_runtime = time() - start_time
+
+		wandb_run.log({
+			'Relative-Speedup': original_runtime / pruned_model_runtime,
+		})
 
 		wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
 		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
@@ -410,51 +417,7 @@ def main():
 		epoch_ += 1
 
 	wandb_run.log({'sparsity': cur_sparsity})
-	print('Done and exitting')
-
-
 
 
 if __name__ == '__main__':
     main()
-
-
-
-# 	# TODO -- ldery -- adjust this and below !
-# 	compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, None, mlp_attn_ratio=args.mlp_attn_ratio)
-
-# 	# TODO -- ldery -- modify this
-# 	n_iter = int(np.floor(np.log(args.sparsity_ratio)/ np.log(1 - args.prune_frac))) - 1
-# 	for i in range(n_iter):
-# 		start = time()
-# 		score_info = get_random_mask_scores(
-# 							model, tokenizer, module_map, all_sampling_proba,
-# 							bsz=args.bsz, nsamples=args.nsamples,
-# 							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
-# 		)
-# 		score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(i))
-# 		gen_scores_time = time() - start
-# 		print('It took ', str(datetime.timedelta(seconds=gen_scores_time)), ' to complete score generation and linear model fit')
-# 		start = time()
-# 		# Need to do some fitting to a linear model here.
-# 		compute_updated_masks_local(args.prune_frac, score_matrix, all_sampling_proba, score_model_maps, mlp_attn_ratio=args.mlp_attn_ratio)
-# 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
-# 		time_delta = time() - start
-		
-# 		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta, 'Pruning/trainPPL': this_ppl})
-# 		print('It took ', str(datetime.timedelta(seconds=time_delta)), ' to complete mask updated and eval of updated model')
-# 		print('[Iter = {}] Took : {} | Achieved train ppl: '.format(i, str(datetime.timedelta(seconds=(time_delta + gen_scores_time)))), this_ppl, flush=True)
-# 		print('===='*20)
-	
-# 	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
-# 	wandb_run.log({'Final/TrainPPL': ppl_train, 'Final/TestPPL': ppl_test})
-# 	print('[Wikitext][After] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
-
-# 	for handle in hook_handles:
-# 		handle.remove()
-
-# 	# Now save all the required information
-# 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
-# 	save_loc = os.path.join(args.save, 'mask_info.pkl')
-# 	with open(save_loc, 'wb') as handle:
-# 		pkl.dump(mask_info, handle)

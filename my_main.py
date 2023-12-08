@@ -171,11 +171,9 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		if regression_weights is None:
 			regression_weights = (info['in'][1] / info['in'][0]).squeeze()
 
-# 		pdb.set_trace()
 		# bias this so that we do not remove any of the fixed indices
-		score_model_weights[fixed_indices] = regression_weights.max() + 1.0
+		score_model_weights[fixed_indices] = regression_weights.max()
 		score_model_weights[use_indices] = regression_weights
-# 		pdb.set_trace()
 
 		if module.main_mask is not None:
 			qt = torch.quantile((score_model_weights[(module.main_mask).squeeze() > 0]).squeeze().float(), prune_frac)
@@ -183,7 +181,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			qt = torch.quantile(score_model_weights.squeeze().float(), prune_frac)
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
-		# account for negative elements
+
+		# account for negative weights. We assume that negative weights are highly suggestive.
 		mask_ *= ((score_model_weights > 0)*1.0).half()
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)
@@ -275,10 +274,11 @@ def args_to_dict(args):
 		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'masksperiter': args.masks_per_iter,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'LinModel.regweight': stringify(args.sm_reg_weight),
-		'LinModel.lr': stringify(args.sm_lr_factor),
-		'LinModel.bsz': stringify(args.sm_bsz),
-		'LinModel.nepochs': args.sm_nepochs,
+		'Lin.regweight': stringify(args.sm_reg_weight),
+		'Lin.lr': stringify(args.sm_lr_factor),
+		'Lin.bsz': stringify(args.sm_bsz),
+		'Lin.nepochs': args.sm_nepochs,
+		'name': args.wandb_project_name
 	}
 
 def args_to_str(args):

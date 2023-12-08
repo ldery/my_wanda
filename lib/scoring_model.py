@@ -56,7 +56,7 @@ class ScoreModelHP(object):
 		self.best_hp = None
 
 	def search_best_linear_fit(self, run_info):
-		normalization = self.base_mask.sum().item() + 1.0 # in case there is division by zero # need to double check
+		normalization = self.base_mask.sum().item() + 1.0 # in case there is division by zero
 		normalization = np.sqrt(normalization)
 		run_info = split_train_test(run_info, normalization) 
 

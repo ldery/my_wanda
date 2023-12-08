@@ -56,7 +56,7 @@ class ScoreModelHP(object):
 		self.best_hp = None
 
 	def search_best_linear_fit(self, run_info):
-		normalization = self.base_mask.sum().item()
+		normalization = self.base_mask.sum().item() + 1.0 # in case there is division by zero # need to double check
 		normalization = np.sqrt(normalization)
 		run_info = split_train_test(run_info, normalization) 
 
@@ -278,6 +278,8 @@ class ScoreModel(nn.Module):
 
 		with torch.no_grad():
 			mean_score_tensor = self.base_model.score_tensor.clone().detach()
+			if mean_score_tensor.sum() == 0:
+				mean_score_tensor = torch.stack(tr_xs).mean(axis=0).view(-1, 1)
 			mean_score_tensor.requires_grad = False
 
 		# Setup the optimizer and learn the new model

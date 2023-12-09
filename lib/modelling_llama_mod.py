@@ -168,6 +168,7 @@ class LlamaAttention(nn.Module):
 		self.is_using_main = True
 		self.intermed_cache = None
 		self.intermediate_size = self.num_heads
+		self.skip_computation = False
 
 
 	def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -182,6 +183,11 @@ class LlamaAttention(nn.Module):
 		output_attentions: bool = False,
 		use_cache: bool = False,
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+		
+		if self.skip_computation:
+			attn_output = torch.zeros_like(hidden_states)
+			return attn_output, None, None
+
 		bsz, q_len, _ = hidden_states.size()
 
 		query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -267,8 +273,13 @@ class LlamaMLP(nn.Module):
 		self.temp_mask = None
 		self.is_using_main = True
 		self.intermed_cache = None
+		self.skip_computation = False
 
 	def forward(self, x):
+
+		if self.skip_computation:
+			return torch.zeros_like(x)
+
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
 		# TODO [ldery] -- work on a better normalization factor (might be more necessary for Mistral model)
 		if self.is_using_main and (self.main_mask is not None):

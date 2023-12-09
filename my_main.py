@@ -182,8 +182,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
 
-		# account for negative weights. We assume that negative weights are highly suggestive.
-		mask_ *= ((score_model_weights > 0)*1.0).half()
+# 		# account for negative weights. We assume that negative weights are highly suggestive.
+# 		mask_ *= ((score_model_weights > 0)*1.0).half()
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)
 		else:
@@ -313,6 +313,11 @@ def prune_mlp(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.intermediate_size = len(index)
+	
+	if len(index) == 0:
+		print("We are pruning the whole layer mlp")
+		# alert to skip computation for this module
+		module.skip_computation = True
 
 	gc.collect()
 	torch.cuda.empty_cache()
@@ -327,7 +332,6 @@ def prune_attn(mask_, module):
 	_, updated_indices = find_pruneable_heads_and_indices(
 		index, module.num_heads, module.head_dim, set()
 	)
-
 
 	new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
 	module.q_proj = None
@@ -352,6 +356,11 @@ def prune_attn(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.intermediate_size = module.num_heads
+
+	if len(updated_indices) == 0:
+		print("We are pruning the whole layer attn")
+		# alert to skip computation for this module
+		module.skip_computation = True
 
 	gc.collect()
 	torch.cuda.empty_cache() 
@@ -424,7 +433,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+# 	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
 
 	origina_param_count = get_param_count(model)

@@ -433,7 +433,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-# 	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
 
 	origina_param_count = get_param_count(model)

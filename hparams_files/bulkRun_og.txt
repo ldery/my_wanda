@@ -1,0 +1,31 @@
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1  --sm_lr 5e-4
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.05 --sm_lr 5e-4
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 250 --save pruning_no_backward --prune_frac 0.1  --sm_lr 5e-4
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 250 --save pruning_no_backward --prune_frac 0.1  --sm_lr 5e-3
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 250 --save pruning_no_backward --prune_frac 0.1  --sm_lr 5e-5
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 50  --nsamples 14 --sm_bsz 25  --save pruning_no_backward --prune_frac 0.05 --sm_lr 5e-4
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 100 --nsamples 70 --sm_bsz 50  --save pruning_no_backward --prune_frac 0.1  --sm_lr 5e-4 --bsz 8
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 1000 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1  --sm_lr 5e-4
+
+
+
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1 --sm_lr 1e-4
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1 --sm_lr -1
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1 --sm_lr 1e-4 --sm_nepochs 0
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 32 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1 --sm_lr 1e-4 --bsz 8
+
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 32 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.1 --sm_lr -1 --bsz 8
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.05 --sm_lr 1e-4
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.05 --sm_lr 1e-4 --sm_nepochs 0
+python my_main.py --wandb_project_name PruneHPStudyWAttn --masks_per_iter 500 --nsamples 14 --sm_bsz 128 --save pruning_no_backward --prune_frac 0.05 --sm_lr -1
+
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 1000 --nsamples 16 --save pruning_no_backward --prune_frac 0.1 --bsz 4 --mlp_attn_ratio 0.5
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 1000 --nsamples 16 --save pruning_no_backward --prune_frac 0.1 --bsz 4 --mlp_attn_ratio 1.0
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 100 --nsamples 128 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 0.5
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 100 --nsamples 32 --save pruning_no_backward --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 1.0
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 1.0 --sm_nepochs 0
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 0.5
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 0.3
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 100 --nsamples 128 --save pruning_no_backward --prune_frac 0.1  --bsz 2 --mlp_attn_ratio 0.5
+python my_main.py --wandb_project_name DynPruneWAttnLlama2 --masks_per_iter 100 --nsamples 32 --save pruning_no_backward --prune_frac 0.05 --bsz 2 --mlp_attn_ratio 1.0

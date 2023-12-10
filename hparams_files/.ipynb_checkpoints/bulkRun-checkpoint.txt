@@ -1,0 +1,6 @@
+python my_main.py --wandb_project_name Prune_global --masks_per_iter 100 --nsamples 32 --save pruning_no_backward --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0
+python my_main.py --wandb_project_name Prune_global --masks_per_iter 100 --nsamples 32 --save pruning_no_backward --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 0.5
+python my_main.py --wandb_project_name Prune_global --masks_per_iter 100 --nsamples 32 --save pruning_no_backward --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 2.0
+python my_main.py --wandb_project_name Prune_global --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 1.0
+python my_main.py --wandb_project_name Prune_global --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 0.5
+python my_main.py --wandb_project_name Prune_global --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 2.0

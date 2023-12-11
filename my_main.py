@@ -167,19 +167,17 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			info_cache[k] = dict()
 
 	# add forward hooks
+	module_map = {}
 	info_cache, hook_handles = defaultdict(dict), []
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
 		if name.endswith('mlp') or name.endswith('self_attn'):
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
-
-	module_map = {}
-	for (name, module) in model.named_modules():
-		# For now, only focus on the MLPs
-		if name.endswith('mlp') or name.endswith('self_attn'):
 			id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
 			module_map[id_] = (name, module)
 			intermediate_sz = module.intermediate_size
+			# set the module prune type here
+			module.prune_method = args.prune_method
 
 	# Initial setup to get the initial probability distribution for sampling
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
@@ -224,6 +222,7 @@ def args_to_dict(args):
 		'sparsity': args.sparsity_ratio,
 		'prune_frac': args.prune_frac,
 		'bsz': args.bsz,
+		'pmethod': args.prune_method,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'masksperiter': args.masks_per_iter,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
@@ -335,14 +334,14 @@ def main():
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
 	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
 
-	parser.add_argument("--prune_method", type=str, choices=["ours", "magnitude", "wanda", "sparsegpt", "ablate_magnitude", "ablate_wanda"])
+	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
 	parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
 	parser.add_argument('--save', type=str, default=None, help='Path to save results.')
 	parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
-	
+
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 0, 1e-4]', help='reg-weight to use')
 	parser.add_argument('--sm_lr_factor', type=str, default='[100, 10, 1, 0.1]', help='lr factor to use for fitting linear model')

@@ -248,7 +248,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 						bsz=args.bsz, nsamples=args.nsamples,
 						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
 	)
-	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(epoch_), model_type='global')
+	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
 	gen_scores_time = time() - start
 	start = time()
 	# Need to do some fitting to a linear model here.
@@ -268,17 +268,18 @@ def args_to_dict(args):
 
 	return {
 		'nsamp': args.nsamples,
-		'sparsity': args.sparsity_ratio,
-		'prune_frac': args.prune_frac,
+		'sp': args.sparsity_ratio,
+		'pfrac': args.prune_frac,
 		'bsz': args.bsz,
-		'mlp_attn_ratio': args.mlp_attn_ratio,
+		'ma_ratio': args.mlp_attn_ratio,
 		'mpi': args.masks_per_iter,
-		'regtype': args.sm_reg_type, 
+		'Lin.regtype': args.sm_reg_type, 
 		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'Lin.regweight': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
 		'Lin.bsz': stringify(args.sm_bsz),
 		'Lin.nepochs': args.sm_nepochs,
+		'Lin.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name
 	}
 
@@ -406,6 +407,8 @@ def main():
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
 	parser.add_argument('--sm_lr_factor', type=str, default='[100, 10, 1, 0.1]', help='lr factor to use for fitting linear model')
 	parser.add_argument('--sm_reg_type', type=str, default="l1", help='type of regularization to apply')
+	parser.add_argument('--sm_lin_model_type', type=str, default="global", help='type of regularization to apply') 
+
 
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')

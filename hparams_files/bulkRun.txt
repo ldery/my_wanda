@@ -3,3 +3,6 @@ python my_main.py --wandb_project_name PruneWWanda --prune_method wanda --masks_
 python my_main.py --wandb_project_name PruneWWanda --prune_method wanda --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 1.0
 python my_main.py --wandb_project_name PruneWWanda --prune_method wanda --masks_per_iter 500 --nsamples 32 --save pruning_no_backward --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 1.0 --sm_nepochs 0
 
+
+
+

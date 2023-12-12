@@ -119,6 +119,11 @@ def run_data_to_sampling_proba(info, module):
 	if module.main_mask is not None:
 		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
 	sampling_proba /= np.sum(sampling_proba)
+	
+	if np.isnan(sampling_proba).any():
+		print('We got nan in the sampling probability')
+		pdb.set_trace()
+
 	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
 	return sampling_proba
 

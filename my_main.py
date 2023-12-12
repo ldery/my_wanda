@@ -272,7 +272,8 @@ def args_to_dict(args):
 		'prune_frac': args.prune_frac,
 		'bsz': args.bsz,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'masksperiter': args.masks_per_iter,
+		'mpi': args.masks_per_iter,
+		'regtype': args.sm_reg_type, 
 		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'Lin.regweight': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
@@ -289,6 +290,7 @@ def get_linearmodel_hpdict(args):
 	base_hp = {
 		'lr_factor' : eval(args.sm_lr_factor),
 		'reg_weight': eval(args.sm_reg_weight),
+		'reg_type': [args.sm_reg_type],
 		'bsz' : eval(args.sm_bsz),
 		'nepochs' : [args.sm_nepochs],
 		'patience': [10],
@@ -399,10 +401,12 @@ def main():
 	parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
-	
+
 	# Hyperparams for scoring model
-	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 0, 1e-4]', help='reg-weight to use')
+	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
 	parser.add_argument('--sm_lr_factor', type=str, default='[100, 10, 1, 0.1]', help='lr factor to use for fitting linear model')
+	parser.add_argument('--sm_reg_type', type=str, default="l1", help='type of regularization to apply')
+
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	

@@ -21,12 +21,19 @@ import gc
 EPS = 1e-10
 
 
-def split_train_test(run_info, normalization, train_frac=0.8):
+def split_train_test(run_info, normalization, num_folds=5, sid=0, no_split=False):
 	# Split into train and test
+	train_frac = 1.0 - (1.0 / num_folds)
 	xs, ys = run_info
 
-	perm = np.random.permutation(len(ys))
-	trn_list, tst_list = perm[:int(train_frac * len(perm))], perm[int(train_frac * len(perm)):]
+	if no_split:
+		trn_list, tst_list = list(range(len(ys))), list(range(len(ys)))
+	else:
+		np.random.seed(0)
+		perm = np.random.permutation(len(ys))
+		bsz = len(ys) // num_folds
+		tst_list = set(range(sid * bsz, (sid + 1)* bsz, 1))
+		trn_list = set(range(len(ys))) - tst_list
 
 	tr_xs, tr_ys = [xs[i] / normalization for i in trn_list], [ys[i] for i in trn_list]
 	tr_ys  = torch.tensor(tr_ys).float().cuda()
@@ -58,27 +65,45 @@ class ScoreModelHP(object):
 	def search_best_linear_fit(self, run_info):
 		normalization = self.base_mask.sum().item() + 1.0 # in case there is division by zero
 		normalization = np.sqrt(normalization)
-		run_info = split_train_test(run_info, normalization) 
 
 		keys = self.hp_dict.keys()
 		values = self.hp_dict.values()
 		hp_list = list(itertools.product(*values))
+
+		num_folds = 5
+		best_fit_tau = float("-inf")
 		for hp_set in hp_list:
 			this_hp = {k:v for k, v in zip(keys, hp_set)}
-			sm = ScoreModel(id_=self.id_, num_players=self.num_players, base_mask=self.base_mask, hp_dict=this_hp)
-			sm.cuda()
-			results_info = sm.update_with_info(run_info, normalization)
-			if (self.best_fit_stats is None) or (results_info[0] > self.best_fit_stats[0]): # compare the kendall tau ranks !
-				self.best_fit_model = (sm.base_model.score_tensor.clone().squeeze()).detach()
-				self.best_fit_stats = results_info
+
+			all_ktaus = []
+			for split_id in range(num_folds):
+				this_run_info = split_train_test(run_info, normalization, num_folds=num_folds, sid=split_id) 
+				sm = ScoreModel(id_=self.id_, num_players=self.num_players, base_mask=self.base_mask, hp_dict=this_hp)
+				sm.cuda()
+				results_info = sm.update_with_info(this_run_info, normalization)
+				all_ktaus.append(results_info[0])
+				del sm
+
+			avg_ktau = np.mean(all_ktaus)
+			if avg_ktau > best_fit_tau:
+				best_fit_tau = avg_ktau
 				self.best_hp = this_hp
-			del sm
+
+
+		sm = ScoreModel(id_=self.id_, num_players=self.num_players, base_mask=self.base_mask, hp_dict=self.best_hp)
+		sm.cuda()
+		this_run_info = split_train_test(run_info, normalization, seed=seed, no_split=True) 
+		results_info = sm.update_with_info(this_run_info, normalization)
+		self.best_fit_model = (sm.base_model.score_tensor.clone().squeeze()).detach()
+		self.best_fit_stats = results_info
+
+		del sm
 
 		# do some wandb logging here with self.best_fit_stats
 		if self.wandb is not None:
 			self.plot_best()
 			self.wandb.log({"best-details/{}".format(self.id_): self.best_hp})
-		
+
 		gc.collect()
 		torch.cuda.empty_cache()
 
@@ -126,24 +151,29 @@ def get_score_model(config, num_layers, num_players, model_type, reg_weight, wan
 
 
 class LinearModel(nn.Module):
-	def __init__(self, num_players, base_mask, reg_weight=None):
+	def __init__(self, num_players, base_mask, reg_weight=None, reg_type='l1'):
 		super(LinearModel, self).__init__()
 		self.score_tensor = nn.parameter.Parameter(create_tensor((num_players, 1)))
 		self.score_bias = nn.parameter.Parameter(create_tensor((1,)))
 		self.num_players = num_players
 		self.base_mask = base_mask
 		self.reg_weight = reg_weight
+		self.reg_type = reg_type
 
 		# Initialize to the base mask
 		with torch.no_grad():
 			self.score_tensor.add_(base_mask)
 
-	def set_prior_variance(self, prior_variance):
-		self.prior_variance = prior_variance
+	def set_reg_weight(self, reg_weight):
+		self.reg_weight = reg_weight
 
 	def regLoss(self, mean_score_tensor):
+		if self.reg_type == 'l1':
+			l1reg = self.score_tensor.abs().sum() * self.reg_weight
+			return l1reg
+
 		mean_score_tensor = 0.0 if mean_score_tensor is None else mean_score_tensor
-		weighted_l2 = ((self.score_tensor - mean_score_tensor)**2)  * self.prior_variance
+		weighted_l2 = ((self.score_tensor - mean_score_tensor)**2)  * self.reg_weight
 		return weighted_l2.sum()
 
 	def forward(self, xs):
@@ -166,7 +196,7 @@ class ScoreModel(nn.Module):
 
 		assert hp_dict is not None, 'List of hyper-parameters have not been specified'
 		self.hp_dict = hp_dict
-		self.base_model = LinearModel(num_players, base_mask, reg_weight=self.hp_dict['reg_weight'])
+		self.base_model = LinearModel(num_players, base_mask, reg_weight=self.hp_dict['reg_weight'], reg_type=self.hp_dict['reg_type'])
 		self.loss_fn = nn.MSELoss()
 		self.candidate_buffer = []
 		self.curr_norm = 1.0
@@ -175,7 +205,7 @@ class ScoreModel(nn.Module):
 
 	def set_prior_variance(self, prior_variance):
 		self.prior_variance = prior_variance
-		self.base_model.set_prior_variance(prior_variance)
+		self.base_model.set_reg_weight(prior_variance)
 
 	def forward(self, xs):
 		return self.base_model.forward(xs)

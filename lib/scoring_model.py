@@ -92,7 +92,7 @@ class ScoreModelHP(object):
 
 		sm = ScoreModel(id_=self.id_, num_players=self.num_players, base_mask=self.base_mask, hp_dict=self.best_hp)
 		sm.cuda()
-		this_run_info = split_train_test(run_info, normalization, seed=seed, no_split=True) 
+		this_run_info = split_train_test(run_info, normalization, no_split=True) 
 		results_info = sm.update_with_info(this_run_info, normalization)
 		self.best_fit_model = (sm.base_model.score_tensor.clone().squeeze()).detach()
 		self.best_fit_stats = results_info

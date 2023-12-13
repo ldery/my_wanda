@@ -118,7 +118,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, pa
 			base_mask = base_mask / base_mask.sum()
 
 			sm_hp_searcher = ScoreModelHP(
-				id_='{}/{}'.format(parent_id, id_), num_players=module.intermediate_size,
+				id_='{}/{}'.format(parent_id, id_), num_players=score_perfs[0][id_][0].numel(),
 				base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
 
 			run_info = score_perfs[0][id_], score_perfs[1][id_]

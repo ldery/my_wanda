@@ -108,20 +108,22 @@ def hook_fn(module_name, info_cache):
 			]
 	return hook
 
-def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, parent_id='.',  model_type='local'):
+def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='.',  model_type='local'):
 	score_map = {}
 	if model_type == 'local':
 		for id_, (name, module) in module_map.items():
 			# Get a score map
+			_, _, use_indices = all_sampling_proba[id_]
 			base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
-			base_mask = (base_mask.squeeze() * module.main_mask.squeeze().float()).view(-1, 1)
-			base_mask = base_mask / base_mask.sum()
+			base_mask = (base_mask.squeeze() * module.main_mask.squeeze().float())[use_indices]
+			base_mask = (base_mask / base_mask.sum()).view(-1, 1)
 
 			sm_hp_searcher = ScoreModelHP(
 				id_='{}/{}'.format(parent_id, id_), num_players=score_perfs[0][id_][0].numel(),
 				base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
 
 			run_info = score_perfs[0][id_], score_perfs[1][id_]
+
 			sm_hp_searcher.search_best_linear_fit(run_info)
 			score_map[id_] = sm_hp_searcher.get_best_fit()
 	else:
@@ -248,7 +250,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 						bsz=args.bsz, nsamples=args.nsamples,
 						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
 	)
-	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
+	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
 	gen_scores_time = time() - start
 	start = time()
 	# Need to do some fitting to a linear model here.

@@ -130,7 +130,8 @@ def run_data_to_sampling_proba(info, module):
 def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 	def update_mask_one_layer(module, info, score_info, prune_frac, score_model_weights):
-		if score_model_weights is None:
+		# It is possible that the linear fit was bad and we ended up with nans.
+		if (score_model_weights is None) or (score_model_weights.isnan().any().item()):
 			score_model_weights = (info['in'][1] / info['in'][0]).squeeze()
 
 		if module.main_mask is not None:
@@ -141,6 +142,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		mask_ = ((score_model_weights > qt)*1.0).half()
 		if mask_.sum() == 0:
 			print('We have encountered a zero sum. Need to fix. Skip Updating this layer')
+			pdb.set_trace()
 			sampling_proba = run_data_to_sampling_proba(info, module)
 			return module.main_mask.mean().item(), sampling_proba
 

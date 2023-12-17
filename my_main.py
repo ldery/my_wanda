@@ -25,6 +25,7 @@ print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
+INF = 1e8
 
 def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
 	for k, (name, module) in module_map.items():
@@ -65,14 +66,18 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
+		this_ppl = this_ppl if this_ppl < INF else INF
+
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
-		
+
 		# set the complement mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, use_complement=True)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
 		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
+		this_ppl = this_ppl if this_ppl < INF else INF
+
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
@@ -163,6 +168,11 @@ def run_data_to_sampling_proba(info, module, pfrac):
 	if module.main_mask is not None:
 		sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
 	sampling_proba /= np.sum(sampling_proba)
+	
+	if np.isnan(sampling_proba).any():
+		print('We got nan in the sampling probability')
+		pdb.set_trace()
+
 	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
 	return sampling_proba, fixed_indices, use_indices
 
@@ -177,6 +187,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		score_model_weights[fixed_indices] = regression_weights.max()
 		score_model_weights[use_indices] = regression_weights
 
+
 		if module.main_mask is not None:
 			qt = torch.quantile((score_model_weights[(module.main_mask).squeeze() > 0]).squeeze().float(), prune_frac)
 		else:
@@ -184,8 +195,11 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
 
-# 		# account for negative weights. We assume that negative weights are highly suggestive.
-# 		mask_ *= ((score_model_weights > 0)*1.0).half()
+		if mask_.sum() == 0:
+			print('We have encountered a zero sum. Need to fix. Skip Updating this layer')
+			sampling_proba = run_data_to_sampling_proba(info, module)
+			return module.main_mask.mean().item(), sampling_proba
+
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)
 		else:
@@ -213,19 +227,17 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			info_cache[k] = dict()
 
 	# add forward hooks
+	module_map = {}
 	info_cache, hook_handles = defaultdict(dict), []
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
 		if name.endswith('mlp') or name.endswith('self_attn'):
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
-
-	module_map = {}
-	for (name, module) in model.named_modules():
-		# For now, only focus on the MLPs
-		if name.endswith('mlp') or name.endswith('self_attn'):
 			id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
 			module_map[id_] = (name, module)
 			intermediate_sz = module.intermediate_size
+			# set the module prune type here
+			module.prune_method = args.prune_method
 
 	# Initial setup to get the initial probability distribution for sampling
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
@@ -276,6 +288,7 @@ def args_to_dict(args):
 		'ma_ratio': args.mlp_attn_ratio,
 		'mpi': args.masks_per_iter,
 		'Lin.regtype': args.sm_reg_type, 
+		'pmethod': args.prune_method,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'Lin.regweight': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
@@ -318,12 +331,13 @@ def prune_mlp(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.intermediate_size = len(index)
-	
+
 	if len(index) == 0:
 		print("We are pruning the whole layer mlp")
 		# alert to skip computation for this module
 		module.skip_computation = True
 
+	module.ins_ = None
 	gc.collect()
 	torch.cuda.empty_cache()
 
@@ -361,6 +375,7 @@ def prune_attn(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.intermediate_size = module.num_heads
+	module.ins_ = None
 
 	if len(updated_indices) == 0:
 		print("We are pruning the whole layer attn")
@@ -397,7 +412,7 @@ def main():
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
 	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
 
-	parser.add_argument("--prune_method", type=str, choices=["ours", "magnitude", "wanda", "sparsegpt", "ablate_magnitude", "ablate_wanda"])
+	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
 	parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
 	parser.add_argument('--save', type=str, default=None, help='Path to save results.')

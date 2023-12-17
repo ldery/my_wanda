@@ -25,6 +25,7 @@ print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
+INF = 1e5
 
 def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0):
 	for k, (name, module) in module_map.items():
@@ -60,6 +61,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
 		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
 		print('Iter : ', iter_, ' PPL = ', this_ppl)
+		this_ppl = this_ppl if this_ppl < INF else INF
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
@@ -271,6 +273,7 @@ def prune_mlp(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.intermediate_size = len(index)
+	module.ins_ = None
 
 	gc.collect()
 	torch.cuda.empty_cache()
@@ -310,6 +313,7 @@ def prune_attn(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.intermediate_size = module.num_heads
+	module.ins_ = None
 
 	gc.collect()
 	torch.cuda.empty_cache() 

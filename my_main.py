@@ -62,9 +62,21 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
 	seed_ = random.randint(0, 1e4)
 	for iter_ in range(mpi // 2):
+		this_bsz = bsz
+
 		# set the layer mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
+
+		# TODO (clean up with a wrapper since this is repeated code)
+		try:
+			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+		except Exception as e:
+			print(e)
+			gc.collect()
+			torch.cuda.empty_cache()
+			this_bsz = 1
+			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
 
@@ -74,7 +86,8 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 		# set the complement mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, use_complement=True)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=bsz, nsamples=nsamples, seed=seed_)
+		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+
 		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
 
@@ -241,7 +254,15 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 	# Initial setup to get the initial probability distribution for sampling
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-	eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+
+	try:
+		eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+	except Exception as e:
+		print(e)
+		gc.collect()
+		torch.cuda.empty_cache()
+		eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=args.nsamples)
+
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))

@@ -210,8 +210,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 		if mask_.sum() == 0:
 			print('We have encountered a zero sum. Need to fix. Skip Updating this layer')
-			sampling_proba = run_data_to_sampling_proba(info, module)
-			return module.main_mask.mean().item(), sampling_proba
+			sampling_proba = run_data_to_sampling_proba(info, module, prune_frac)
+			return module.main_mask.mean().item()
 
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)

@@ -285,6 +285,7 @@ class LlamaMLP(nn.Module):
 		self.ins_ = None
 
 	def forward(self, x):
+		# B x S x 11008 -> (BxS)x11008
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
 		# TODO [ldery] -- work on a better normalization factor (might be more necessary for Mistral model)
 		if self.is_using_main and (self.main_mask is not None):

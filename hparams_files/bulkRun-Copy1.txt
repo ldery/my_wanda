@@ -1,0 +1,18 @@
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/ablateCVL1  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_nepochs 0
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/ablateCVL1  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l1 --sm_lin_model_type local
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/ablateCVL1  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l2 --sm_lin_model_type local
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/ablateCVL1  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l1 --sm_lin_model_type global
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/ablateCVL1  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l2 --sm_lin_model_type global
+
+python my_main.py --wandb_project_name PruneWWanda  --masks_per_iter 500 --nsamples 32 --save pruning_no_backward  --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 1.0 --prune_method wanda
+python my_main.py --wandb_project_name PruneWWanda  --masks_per_iter 500 --nsamples 32 --save pruning_no_backward  --prune_frac 0.1  --bsz 4 --mlp_attn_ratio 0.5 --prune_method wanda
+python my_main.py --wandb_project_name PruneWWanda  --masks_per_iter 100 --nsamples 32 --save pruning_no_backward  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --prune_method wanda
+python my_main.py --wandb_project_name PruneWWanda  --masks_per_iter 100 --nsamples 32 --save pruning_no_backward  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 0.5 --prune_method wanda
+
+
+### LATEST VERSION ####
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/wandaBase  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_nepochs 0 --prune_method wanda
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/wandaBase  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l1 --sm_lin_model_type local  --prune_method wanda
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/wandaBase  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l2 --sm_lin_model_type local  --prune_method wanda
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/wandaBase  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l1 --sm_lin_model_type global --prune_method wanda
+python my_main.py --wandb_project_name CVandL1  --masks_per_iter 200 --nsamples 32 --save pruning_no_backward/wandaBase  --prune_frac 0.05 --bsz 4 --mlp_attn_ratio 1.0 --sm_reg_type l2 --sm_lin_model_type global --prune_method wanda

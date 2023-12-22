@@ -156,15 +156,6 @@ class LlamaMLP(nn.Module):
 		self.act_fn = ACT2FN[hidden_act]
 		self.intermediate_size = intermediate_size
 
-# 	def forward(self, x):
-# 		np.random.seed(self.intermediate_size)
-# 		mask_ = torch.tensor(np.random.uniform(size=(1, 1, self.intermediate_size)) < 0.8).type(x.dtype)
-# 		mask_ = mask_.to(x.device)
-# 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-# 		intermed_result = intermed_result * mask_
-# # 		delta = (intermed_result * (1.0 - mask_)).mean(axis=-1, keepdims=True)
-# # 		intermed_result = intermed_result - delta
-# 		return self.down_proj(intermed_result)
 	def forward(self, x):
 		return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 

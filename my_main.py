@@ -161,10 +161,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 
 		sm_hp_searcher.search_best_linear_fit((xs, ys))
 		best_fit = sm_hp_searcher.get_best_fit()
-		start_idx = 0
-		for id_, (name, module) in module_map.items():
-			this_group = best_fit[start_idx: (start_idx + len(score_perfs[0][id_][0]))]
-			score_map[id_] = this_group
+		score_map[model_type] = best_fit 
 	return score_map
 
 def run_data_to_sampling_proba(info, module, pfrac):
@@ -191,7 +188,7 @@ def run_data_to_sampling_proba(info, module, pfrac):
 
 def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
-	def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices):
+	def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
 		score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
 		if regression_weights is None:
 			regression_weights = (info['in'][1] / info['in'][0]).squeeze()
@@ -201,10 +198,13 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		score_model_weights[use_indices] = regression_weights
 
 
-		if module.main_mask is not None:
-			qt = torch.quantile((score_model_weights[(module.main_mask).squeeze() > 0]).squeeze().float(), prune_frac)
+		if preset_qt is None:
+			if module.main_mask is not None:
+				qt = torch.quantile((score_model_weights[(module.main_mask).squeeze() > 0]).squeeze().float(), prune_frac)
+			else:
+				qt = torch.quantile(score_model_weights.squeeze().float(), prune_frac)
 		else:
-			qt = torch.quantile(score_model_weights.squeeze().float(), prune_frac)
+			qt = preset_qt
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
 
@@ -220,7 +220,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 		return module.main_mask.mean().item()
 
-	def compute_updated_masks_local(prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=1.0):
+	def compute_updated_masks_local(prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=1.0, preset_qt=None):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
 			this_prune_frac = prune_frac
@@ -232,12 +232,19 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			this_avg = update_mask_one_layer(
 										module, info_cache[name], 
 										score_matrix[id_], this_prune_frac,
-										score_model, fixed_indices, use_indices)
+										score_model, fixed_indices, use_indices, preset_qt=preset_qt)
 			avgs += this_avg
 
 		# Clear the info-cache for the next round !
 		for k, v in info_cache.items():
 			info_cache[k] = dict()
+
+	def compute_updated_masks_global(prune_frac, score_matrix, score_model_map, all_sampling_proba, mlp_attn_ratio=1.0,):
+		start_idx = 0
+		for id_, (name, module) in module_map.items():
+			this_group = best_fit[start_idx: (start_idx + len(score_perfs[0][id_][0]))]
+			score_map[id_] = this_group
+
 
 	# add forward hooks
 	module_map = {}
@@ -287,7 +294,35 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	gen_scores_time = time() - start
 	start = time()
 	# Need to do some fitting to a linear model here.
-	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio)
+	preset_qt = None
+	if args.sm_lin_model_type == 'global':
+		best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
+		init_param_counts = np.zeros_like(best_fit)
+		start_idx = 0
+		for id_, (name, module) in module_map.items():
+			num_entries =  len(score_info[0][id_][0])
+			if name.endswith('mlp'):
+				init_param_counts[start_idx: (start_idx + num_entries)] = model.model.params_per_pruned_hidden
+			else:
+				init_param_counts[start_idx: (start_idx + num_entries)] = model.model.params_per_pruned_head
+			start_idx += num_entries
+
+		sort_idxs = np.argsort(best_fit)
+		cum_sum_param_counts = np.cumsum(init_param_counts[sort_idxs])
+		threshold = int(model.original_param_count * args.prune_frac)
+		keep_idxs = (cum_sum_param_counts > threshold) * 1.0
+		best_fit = torch.tensor(keep_idxs[np.argsort(sort_idxs)], device=score_model_maps[args.sm_lin_model_type].device).float()
+		# We need to do some prep here
+		start_idx = 0
+		del score_model_maps[args.sm_lin_model_type]
+		for id_, (name, module) in module_map.items():
+			num_entries =  len(score_info[0][id_][0])
+			this_group = best_fit[start_idx: (start_idx + num_entries)]
+			score_model_maps[id_] = this_group
+			start_idx += num_entries
+		preset_qt = 0
+
+	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt)
 	time_delta = time() - start
 	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
@@ -481,8 +516,9 @@ def main():
 	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
 
-	origina_param_count = get_param_count(model)
-	cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
+	original_param_count = get_param_count(model)
+	model.original_param_count = original_param_count
+	cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
 	epoch_ = 1
 	while True:
 		if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
@@ -502,7 +538,8 @@ def main():
 
 		print('Prune model')
 		prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
-		cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
+		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
+		print(model)
 
 		# Evaluate the performance of the pruned model
 		start_time = time()

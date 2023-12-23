@@ -517,6 +517,12 @@ class LlamaModel(LlamaPreTrainedModel):
 		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 		self.layers = nn.ModuleList([LlamaDecoderLayer(config, i_) for i_ in range(config.num_hidden_layers)])
 		self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		
+		# Do some setup to compute size of important units here
+		self.params_per_pruned_hidden = config.hidden_size * 3 # [gate_proj, up_proj, down_projs]
+		
+		head_dim = config.hidden_size // config.num_attention_heads
+		self.params_per_pruned_head = (head_dim * config.hidden_size) * 4 #(num parameters per-head) * [3 (kqv) + 1(o)]
 
 		self.gradient_checkpointing = False
 		# Initialize weights and apply final processing

@@ -351,7 +351,8 @@ def args_to_dict(args):
 		'Lin.bsz': stringify(args.sm_bsz),
 		'Lin.nepochs': args.sm_nepochs,
 		'Lin.type': args.sm_lin_model_type,
-		'name': args.wandb_project_name
+		'name': args.wandb_project_name,
+		'Adaptive': 'Yes'
 	}
 
 def args_to_str(args):

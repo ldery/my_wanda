@@ -171,6 +171,8 @@ class LlamaAttention(nn.Module):
 		self.intermediate_size = self.num_heads
 		self.skip_computation = False
 		self.ins_ = None
+		self.cache_in_cpu = False
+		self.ins_cpu = None
 
 
 	def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -189,6 +191,9 @@ class LlamaAttention(nn.Module):
 		if self.skip_computation:
 			attn_output = torch.zeros_like(hidden_states)
 			return attn_output, None, None
+
+		if self.cache_in_cpu:
+			self.ins_cpu = hidden_states.detach().cpu()
 
 		bsz, q_len, _ = hidden_states.size()
 

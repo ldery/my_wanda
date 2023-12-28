@@ -2,20 +2,21 @@ import argparse
 import os 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 import pdb
 from time import time
 import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
-from lib.modelling_llama_mod import LlamaForCausalLM
+from lib.modelling_llama_mod import LlamaForCausalLM, LlamaAttention, LlamaMLP
 # from lib.my_prune import my_check_sparsity, my_method_prune
-from lib.eval import eval_ppl, eval_ppl_trainonly
+from lib.eval import eval_ppl, eval_ppl_trainonly, get_val_data_and_teacherlogits
 from collections import defaultdict
 import pickle as pkl
 import random
 from lib.scoring_model import ScoreModelHP
+from torch.optim import Adam
 import wandb
 from transformers.pytorch_utils import  find_pruneable_heads_and_indices, prune_linear_layer
 import gc
@@ -105,7 +106,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
 	model = LlamaForCausalLM.from_pretrained(
 		model_name, 
 		torch_dtype=torch.float16, 
-		cache_dir=cache_dir, 
+		cache_dir=cache_dir,
 		low_cpu_mem_usage=True, 
 		device_map="auto"
 	)
@@ -113,17 +114,26 @@ def get_llm(model_name, cache_dir="llm_weights"):
 	model.seqlen = model.config.max_position_embeddings 
 	return model
 
-def hook_fn(module_name, info_cache):
+def hook_fn(module_name, info_cache, save_innout=False):
 	def hook(module, in_, out_):
-		flat_in = (module.intermed_cache).clone().detach().float()
-		module.intermed_cache = None
-		if 'in' not in info_cache[module_name]:
-			info_cache[module_name]['in'] = [1, flat_in]
+		if save_innout:
+			if 'mlp' in module_name:
+				input_info = in_[0].detach().cpu()
+			else:
+				input_info = module.ins_cpu
+				module.ins_cpu = None
+			info_cache[module_name] = (input_info, out_[0].detach().cpu())
+			module.intermed_cache = None
 		else:
-			info_cache[module_name]['in'] = [
-				info_cache[module_name]['in'][0] + 1,  
-				info_cache[module_name]['in'][1].add_(flat_in)
-			]
+			flat_in = (module.intermed_cache).clone().detach().float()
+			module.intermed_cache = None
+			if 'in' not in info_cache[module_name]:
+				info_cache[module_name]['in'] = [1, flat_in]
+			else:
+				info_cache[module_name]['in'] = [
+					info_cache[module_name]['in'][0] + 1,  
+					info_cache[module_name]['in'][1].add_(flat_in)
+				]
 	return hook
 
 def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='.',  model_type='local'):
@@ -283,11 +293,17 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 						bsz=args.bsz, nsamples=args.nsamples,
 						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
 	)
-	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
+	score_model_maps = get_score_models(
+							score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba,
+							parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type
+						)
 	gen_scores_time = time() - start
 	start = time()
 	# Need to do some fitting to a linear model here.
-	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio)
+	compute_updated_masks_local(
+			args.prune_frac, score_matrix, score_model_maps, 
+			all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio
+	)
 	time_delta = time() - start
 	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
@@ -420,8 +436,145 @@ def prune_model(args, model, mask_info, tokenizer):
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
 
 	gc.collect()
-	torch.cuda.empty_cache() 
+	torch.cuda.empty_cache()
 
+def setup_distillation_info(model, args, tokenizer, ndist_samples=8):
+
+	def hook_teardown_fn(hook_handles):
+		for handle in hook_handles:
+			handle.remove()
+
+	def hook_setup_fn(dict_to_save_info):
+		hook_handles = []
+		for (name, module) in model.named_modules():
+			# For now, only focus on the MLPs
+			if name.endswith('mlp') or name.endswith('self_attn'):
+				if name.endswith('self_attn'):
+					module.cache_in_cpu = True 
+				hook_handles.append(module.register_forward_hook(hook_fn(name, dict_to_save_info, save_innout=True)))
+		return hook_handles
+
+	dist_info = get_val_data_and_teacherlogits(
+				model, tokenizer, hook_setup_fn, hook_teardown_fn, bs=args.bsz,
+				nsamples=ndist_samples, device=model.device, seed=args.seed
+			)
+	for (name, module) in model.named_modules():
+		# For now, only focus on the MLPs
+		if name.endswith('self_attn'):
+			module.cache_in_cpu = False
+			module.ins_cpu = None
+	
+	gc.collect()
+	torch.cuda.empty_cache()
+	return dist_info
+
+import copy
+from torch.cuda.amp import GradScaler
+
+def distill_module(module,  name, distill_info, device=torch.device("cuda:0"), nepochs=30):
+
+	clone_ = copy.deepcopy(module).float()
+	# Set Requires Grad to False
+	for v in module.parameters():
+		v.requires_grad = False
+
+	val_idx = np.random.choice(len(distill_info), size=1)[0]
+	optim = Adam(clone_.parameters(), lr=1e-5)
+	best_val_loss, best_copy, patience = 1e10, None, 0
+	use_amp, position_ids = True, None
+	scaler = GradScaler(enabled=use_amp)
+	print("Doing distillation for : ", name)
+	for epoch_ in range(nepochs):
+		perm = np.random.permutation(len(distill_info))
+		epoch_val_loss = 0
+		for idx_ in perm:
+			if idx_ == val_idx: continue
+			teacher_in_, teacher_out_ = distill_info[idx_][name]
+
+			teacher_out_ = teacher_out_.to(device)
+			teacher_in_ = teacher_in_.to(device)
+			with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+				if 'mlp' in name:
+					our_out_ = clone_(teacher_in_)
+				else:
+					seqlen = teacher_in_.shape[1]
+					if position_ids is None:
+						position_ids = torch.arange(
+							0, seqlen, dtype=torch.long, device=device
+						)
+						position_ids = position_ids.unsqueeze(0).view(-1, seqlen)
+					our_out_ = clone_(hidden_states=teacher_in_, position_ids=position_ids)
+					our_out_ = our_out_[0]
+
+				# Do some L2 loss here
+				train_loss = ((teacher_out_ - our_out_)**2).mean()
+				reg = sum([((og - new)**2).mean() for og, new in zip(module.parameters(), clone_.parameters())])
+				loss = train_loss + reg
+
+			scaler.scale(loss).backward()
+			scaler.step(optim)
+			scaler.update()
+			optim.zero_grad(set_to_none=True)
+
+			gc.collect()
+			torch.cuda.empty_cache()
+
+			with torch.no_grad():
+				teacher_in_, teacher_out_ = distill_info[val_idx][name]
+				teacher_in_ = teacher_in_.to(device)
+				teacher_out_ = teacher_out_.to(device)
+				with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=use_amp):
+					if 'mlp' in name:
+						our_out_ = clone_(teacher_in_)
+					else:
+						seqlen = teacher_in_.shape[1]
+						our_out_ = clone_(hidden_states=teacher_in_, position_ids=position_ids)
+						our_out_ = our_out_[0]
+
+					val_loss = ((teacher_out_ - our_out_)**2).mean()
+
+			epoch_val_loss += val_loss.item()
+			gc.collect()
+			torch.cuda.empty_cache()
+
+		epoch_val_loss /= (len(distill_info) - 1)
+		if (epoch_ == 0) or (epoch_ == (nepochs - 1)):
+			print('[Epoch {}] Train loss {:.6f} | Val loss {:.6f} | Reg {:.10f}'.format(epoch_, train_loss.item(), val_loss.item(), reg.item()))
+
+		if best_val_loss > epoch_val_loss:
+			best_val_loss = epoch_val_loss
+			best_copy = copy.deepcopy(clone_)
+			patience = 0
+			# decide if making a clone of the clone is necessary
+
+		patience += 1
+		if patience > 3:
+			print('[Epoch {}] Train loss {:.6f} | Val loss {:.6f} | Reg {:.10f}'.format(epoch_, train_loss.item(), val_loss.item(), reg.item()))
+			break
+		gc.collect()
+		torch.cuda.empty_cache()
+
+	with torch.no_grad():
+		for og, new in zip(module.parameters(), best_copy.parameters()):
+			og.mul_(0.0).add_(new.half())
+	gc.collect()
+	torch.cuda.empty_cache()
+	# We now have an updated clone
+	# Do the reset here to force the module to receive info
+
+
+def do_model_distillation(model, args, info_for_distillation):
+	# We'll have to do some hook stuff here too !
+	config = AutoConfig.from_pretrained(args.model)
+	for (name, module) in model.named_modules():
+		if name not in info_for_distillation[0]:
+			continue
+
+		# We have to do a little optimization here and there
+		distill_module(module, name, info_for_distillation, device=model.device)
+		gc.collect()
+		torch.cuda.empty_cache()
+		# We should have an updated module at this point !
 
 def main():
 	parser = argparse.ArgumentParser()
@@ -478,8 +631,11 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
+
+	# Do setup here to enable distillation
+	info_for_distillation = setup_distillation_info(model, args, tokenizer)
 
 	origina_param_count = get_param_count(model)
 	cur_sparsity = 1.0 - (get_param_count(model) / origina_param_count)
@@ -513,8 +669,17 @@ def main():
 			'Relative-Speedup': original_runtime / pruned_model_runtime,
 		})
 
-		wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
-		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
+		# Do some distillation here. We pick a subset of the data to distillation w.r.t
+		do_model_distillation(model, args, info_for_distillation)
+
+		# Evaluate if distillation helped things !
+		distill_ppl_train, distill_ppl_test = eval_ppl(model, tokenizer, model.device)
+		info_to_log = {
+				'Sparsity': cur_sparsity, 'TrainPPL-Before-Distill': ppl_train, 'TrainPPL-After-Distill': distill_ppl_train,
+				'TestPPL-Before-Distill': ppl_test, 'TestPPL-After-Distill': distill_ppl_test
+		}
+		wandb_run.log(info_to_log)
+		print("| ".join(["{} = {:.3f}".format(k, v) for k, v in info_to_log.items()]))
 
 		epoch_ += 1
 

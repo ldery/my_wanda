@@ -3,8 +3,9 @@ import time
 import torch
 import torch.nn as nn
 import pdb
+import gc
 # Import get_loaders function from data module within the same directory
-from .data import get_loaders 
+from .data import get_loaders, get_wikitext2
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
 def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
@@ -23,7 +24,39 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
 	with torch.no_grad():
 		ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
 		ppl_train = eval_ppl_wikitext_train(model, trainloader, 1, device)
-	return ppl_train, ppl_test 
+	return ppl_train, ppl_test
+
+def get_val_data_and_teacherlogits(model, tokenizer, hook_setup_fn, hook_teardown_fn, bs=1, nsamples=128, device=torch.device("cuda:0"), seed=0, seqlen=512):
+	testloader = get_wikitext2(nsamples, seed, model.seqlen, tokenizer, split='validation')
+	distillation_info = []
+	with torch.no_grad():
+		testenc = testloader.input_ids
+		# Calculate number of samples
+		total_samples = testenc.numel() // seqlen
+		nsamples = min(total_samples, nsamples)
+		# Loop through each batch
+		for i in range(0, nsamples, bs):
+			# clear so we have enough memory
+			gc.collect()
+			torch.cuda.empty_cache()
+
+			batch_activation_info = {}
+			hooks = hook_setup_fn(batch_activation_info)
+
+			# Calculate end index
+			j = min(i + bs, nsamples)
+
+			# Prepare inputs and move to device
+			inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
+			inputs = inputs.reshape(j-i, model.seqlen)
+
+			# Forward pass through the model
+			model(inputs)
+			distillation_info.append(batch_activation_info)
+			hook_teardown_fn(hooks)
+
+	return distillation_info
+
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
 def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0"), seed=0):

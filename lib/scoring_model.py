@@ -61,10 +61,12 @@ class ScoreModelHP(object):
 		self.best_fit_model = None
 		self.best_fit_stats = None
 		self.best_hp = None
+		self.candidate_buffer = []
 
 	def search_best_linear_fit(self, run_info):
 		normalization = self.base_mask.sum().item() + 1.0 # in case there is division by zero
 		normalization = np.sqrt(normalization)
+		self.normalization = normalization
 
 		keys = self.hp_dict.keys()
 		values = self.hp_dict.values()
@@ -94,7 +96,11 @@ class ScoreModelHP(object):
 		sm.cuda()
 		this_run_info = split_train_test(run_info, normalization, no_split=True) 
 		results_info = sm.update_with_info(this_run_info, normalization)
+
 		self.best_fit_model = (sm.base_model.score_tensor.clone().squeeze()).detach()
+
+		(xs, ys), _ = this_run_info
+		self.cov_mat = self.get_cov_mat(torch.stack(xs).cuda())
 		self.best_fit_stats = results_info
 
 		del sm
@@ -107,8 +113,46 @@ class ScoreModelHP(object):
 		gc.collect()
 		torch.cuda.empty_cache()
 
+	def get_cov_mat(self, xs):
+		variances = (xs.T).matmul(xs) + torch.eye(xs.shape[-1]).cuda()
+		cov_mat = torch.linalg.inv(variances).cpu()
+		return cov_mat
+
 	def get_best_fit(self):
 		return self.best_fit_model
+
+	def get_candidate(self, pool_size=500):
+		assert self.best_fit_model is not None, 'You have not instantiated the best fit model yet'
+
+		if len(self.candidate_buffer):
+			result = self.candidate_buffer.pop()
+			return result.cuda()
+
+		base_set = torch.zeros(pool_size, self.num_players, device=self.best_fit_model.device) + 0.5
+		random_sample = torch.bernoulli(base_set)
+		normed_rand_sample = random_sample / self.normalization
+
+		# Do a selection based on UCB
+		with torch.no_grad():
+			preds_ = normed_rand_sample.matmul(self.best_fit_model)
+			scale_p = np.floor(np.log10(preds_.max().item()))
+			stds_ = (normed_rand_sample.matmul(self.cov_mat.cuda()) * normed_rand_sample).sum(axis=-1, keepdim=True)
+			stds_ = stds_.sqrt()
+			scale_s = np.floor(np.log10(stds_.max().item()))
+			std_scale = 10**(scale_p - scale_s - 1)
+			stds_ = stds_ * std_scale
+# 			print('Pred range : ', preds_.max().item(), preds_.min().item())
+# 			print('Stds range : ', stds_.max().item(), stds_.min().item())
+			total = preds_.squeeze() + stds_.squeeze()
+# 			print('Totals range : ', total.max().item(), total.min().item())
+			stats = total.mean().item(), total.max().item(), total.min().item()
+			chosen_idx = torch.argsort(total)[-5:]
+			chosen = random_sample[chosen_idx].cpu().half()
+			self.candidate_buffer.extend(chosen.unbind())
+
+		torch.cuda.empty_cache()
+		result = self.candidate_buffer.pop()
+		return result.cuda()
 
 	def plot_best(self):
 		wandb_dict = self.best_fit_stats[-1]
@@ -209,43 +253,6 @@ class ScoreModel(nn.Module):
 
 	def forward(self, xs):
 		return self.base_model.forward(xs)
-
-# 	# TODO [ldery] -- double check and fix this
-# 	def get_candidate(self, pool_size=10000):
-# 		if len(self.candidate_buffer) == 0: 
-# 			pool_size = 1 #if self.base_model.base_mask is None else pool_size
-# 			base_set = torch.zeros(pool_size, self.base_model.num_players + 1, device=self.base_model.score_tensor.device) + 0.5
-# 			random_sample = torch.bernoulli(base_set)
-# 			if self.base_model.base_mask is None:
-# 				return random_sample.cpu().squeeze()
-
-# 			random_sample *= self.base_model.base_mask
-# 			random_sample[:, -1] = 1
-# 			normed_rand_sample = random_sample / self.curr_norm
-
-# 			# Do a selection based on UCB
-# 			with torch.no_grad():
-# 				preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
-# 				normed_rand_sample = normed_rand_sample
-
-# 				stds_ = (normed_rand_sample.matmul(self.cov_mat) * normed_rand_sample).sum(axis=-1, keepdim=True)
-# 				stds_ = stds_.sqrt()
-# 				print('Pred range : ', preds_.max().item(), preds_.min().item())
-# 				print('Stds range : ', stds_.max().item(), stds_.min().item())
-# 				total = (preds_ + stds_).squeeze()
-# 				print('Totals range : ', total.max().item(), total.min().item())
-# 				stats = total.mean().item(), total.max().item(), total.min().item()
-# 				if self.wandb is not None:
-# 					self.wandb.log({
-# 						'epoch': self.overall_iter, 'candidates/mean': stats[0],
-# 						'candidates/max': stats[1], 'candidates/min': stats[2]
-# 					})
-# 				print('[Exp] Mean : {:.4f} | Max : {:.4f} | Min : {:.4f}'.format(*stats))
-# 				chosen_idx = torch.argsort(total)[-10:]
-# 				chosen = random_sample[chosen_idx].cpu()
-# 				self.candidate_buffer.extend(chosen.unbind())
-
-# 		return self.candidate_buffer.pop()
 
 	def run_epoch(self, epoch_, xs, ys, mean=None, is_train=True):
 		# generate a permutation
@@ -354,15 +361,7 @@ class ScoreModel(nn.Module):
 			del self.base_model
 			self.base_model = clone
 
-		# Find the posterior variance here
 		with torch.no_grad():
-			tr_xs = torch.stack(tr_xs).cuda()
-
-# 			variances = (tr_xs.T).matmul(tr_xs)
-# # 			print('Max : ', variances.max(), 'Min : ', variances.min().item())
-# 			variances += (torch.eye(tr_xs.shape[-1]).cuda() * self.prior_variance)
-# 			self.cov_mat = torch.linalg.inv(variances)
-
 			ts_xs = torch.stack(ts_xs).float().cuda()
 			ts_ys = ts_ys.cpu().numpy()
 			with torch.no_grad():

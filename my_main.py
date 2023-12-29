@@ -27,7 +27,8 @@ print('# of gpus: ', torch.cuda.device_count())
 
 INF = 1e8
 
-def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
+def set_masks(module_map, all_masks, all_sampling_proba, mask_to_use=None, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
+	start_ = 0
 	for k, (name, module) in module_map.items():
 		if name.endswith('self_attn'):
 			this_pfrac = pfrac * mlp_attn_ratio
@@ -39,9 +40,17 @@ def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_rat
 			module.temp_mask[:, :, fixed_indices] = 1.0
 			all_masks[k].append(module.temp_mask.cpu().squeeze()[use_indices])
 		else:
-			mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, this_pfrac)
-			module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
+			if mask_to_use is not None:
+				mask = torch.ones_like(module.main_mask)
+				mask[:, :, use_indices] = (mask_to_use[start_:(start_ + len(use_indices))]).view((mask[:, :, use_indices]).shape)
+				start_ += len(use_indices)
+			else:
+				mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, this_pfrac)
+				module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
 			all_masks[k].append(torch.Tensor(mask).squeeze()[use_indices])
+
+	if mask_to_use is not None:
+		assert start_ == len(mask_to_use), 'There is something wrong with the length of the mask_to_use'
 
 def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set = np.ones((1, 1, intermediate_sz)) if main_mask is None else main_mask.cpu().numpy()
@@ -53,7 +62,7 @@ def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set[:, :, chosen_idxs] = 0
 	return init_set
 
-def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
+def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_dict=None, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0, fit_cov_every=0.3):
 
 	# set to use main
 	for k, (name, module) in module_map.items():
@@ -61,11 +70,19 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
 	seed_ = random.randint(0, 1e4)
+	fit_cov_every = int((mpi // 2) * fit_cov_every)
+	sm_hp_searcher = None
+	this_list = []
 	for iter_ in range(mpi // 2):
 		this_bsz = bsz
 
 		# set the layer mask here
-		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
+		mask_to_use = None
+		if sm_hp_searcher is not None:
+			mask_to_use = sm_hp_searcher.get_candidate()
+			this_list.append(mask_to_use)
+
+		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, mask_to_use=mask_to_use)
 
 		# TODO (clean up with a wrapper since this is repeated code)
 		try:
@@ -94,6 +111,12 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
+
+		if iter_ and (iter_ % fit_cov_every) == 0:
+			# do the covariance model fit here
+			sm_hp_searcher = global_score_fit((all_masks, all_perfs), module_map, hp_dict, return_searcher=True)
+			gc.collect()
+			torch.cuda.empty_cache()
 
 	# reset to use main
 	for k, (name, module) in module_map.items():
@@ -126,6 +149,30 @@ def hook_fn(module_name, info_cache):
 			]
 	return hook
 
+def global_score_fit(score_perfs, module_map, hp_dict, wandb_run=None, parent_id='.', return_searcher=False):
+	# do some global modelling here
+	# aggregate all the data here
+	xs = None
+	for id_, (name, module) in module_map.items():
+		if xs is None:
+			xs = score_perfs[0][id_]
+		else:
+			xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
+	xs = [k.cuda() for k in xs]
+	ys = score_perfs[1][id_]
+	sm_hp_searcher = ScoreModelHP(
+			id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
+			base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
+
+	sm_hp_searcher.search_best_linear_fit((xs, ys))
+	best_fit = sm_hp_searcher.get_best_fit()
+
+	# Will need this if we are doing a search for candidates
+	if return_searcher:
+		return sm_hp_searcher
+
+	return best_fit
+
 def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='.',  model_type='local'):
 	score_map = {}
 	if model_type == 'local':
@@ -145,23 +192,8 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 			sm_hp_searcher.search_best_linear_fit(run_info)
 			score_map[id_] = sm_hp_searcher.get_best_fit()
 	else:
-		# do some global modelling here
-		# aggregate all the data here
-		xs = None
-		for id_, (name, module) in module_map.items():
-			if xs is None:
-				xs = score_perfs[0][id_]
-			else:
-				xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
-		xs = [k.cuda() for k in xs]
-		ys = score_perfs[1][id_]
-		sm_hp_searcher = ScoreModelHP(
-				id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
-				base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
-
-		sm_hp_searcher.search_best_linear_fit((xs, ys))
-		best_fit = sm_hp_searcher.get_best_fit()
-		score_map[model_type] = best_fit 
+		best_fit = global_score_fit(score_perfs, module_map, hp_dict, wandb_run)
+		score_map[model_type] = best_fit
 	return score_map
 
 def run_data_to_sampling_proba(info, module, pfrac):
@@ -287,7 +319,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	start = time()
 	score_info = get_random_mask_scores(
 						model, tokenizer, module_map, all_sampling_proba,
-						bsz=args.bsz, nsamples=args.nsamples,
+						bsz=args.bsz, nsamples=args.nsamples, hp_dict=hp_dict,
 						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
 	)
 	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
@@ -337,7 +369,7 @@ def args_to_dict(args):
 		return '-'.join([str(y) for y in eval(x)])
 
 	return {
-		'nsamp': args.nsamples,
+		'ns': args.nsamples,
 		'sp': args.sparsity_ratio,
 		'pfrac': args.prune_frac,
 		'bsz': args.bsz,
@@ -346,13 +378,14 @@ def args_to_dict(args):
 		'Lin.regtype': args.sm_reg_type, 
 		'pmethod': args.prune_method,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'Lin.regweight': stringify(args.sm_reg_weight),
-		'Lin.lr': stringify(args.sm_lr_factor),
-		'Lin.bsz': stringify(args.sm_bsz),
-		'Lin.nepochs': args.sm_nepochs,
-		'Lin.type': args.sm_lin_model_type,
+		'L.reg': stringify(args.sm_reg_weight),
+		'L.lr': stringify(args.sm_lr_factor),
+		'L.bsz': stringify(args.sm_bsz),
+		'L.neps': args.sm_nepochs,
+		'L.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name,
-		'Adaptive': 'Yes'
+		'Adapt': 'Yes',
+		'Expl': 'Yes'
 	}
 
 def args_to_str(args):

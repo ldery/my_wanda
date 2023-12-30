@@ -30,9 +30,10 @@ INF = 1e8
 
 def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
     for k, (name, module) in module_map.items():
-        if name.endswith('self_attn'):
-            this_pfrac = pfrac * mlp_attn_ratio
+        #        if name.endswith('self_attn'):
+#            this_pfrac = pfrac * mlp_attn_ratio
 
+        this_pfrac = pfrac
         module.is_using_main = False
         sampling_proba, fixed_indices, use_indices = all_sampling_proba[k]
         if use_complement:
@@ -225,8 +226,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
         avgs = 0.0
         for id_, (name, module) in module_map.items():
             this_prune_frac = prune_frac
-            if name.endswith('self_attn'):
-                this_prune_frac = prune_frac * mlp_attn_ratio
+#            if name.endswith('self_attn'):
+#                this_prune_frac = prune_frac * mlp_attn_ratio
 
             _, fixed_indices, use_indices = all_sampling_proba[id_]
             score_model = None if score_model_maps is None else score_model_maps[id_]
@@ -252,7 +253,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
     info_cache, hook_handles = defaultdict(dict), []
     for (name, module) in model.named_modules():
         # For now, only focus on the MLPs
-        if name.endswith('mlp') or name.endswith('self_attn'):
+        if name.endswith('mlp'): # or name.endswith('self_attn'):
             hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
             id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
             module_map[id_] = (name, module)
@@ -276,8 +277,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
     all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
     for id_, (name, module) in module_map.items():
         this_pfrac = args.prune_frac
-        if name.endswith('self_attn'):
-            this_pfrac = this_pfrac * args.mlp_attn_ratio
+#        if name.endswith('self_attn'):
+#            this_pfrac = this_pfrac * args.mlp_attn_ratio
         all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
         module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
 
@@ -450,8 +451,8 @@ def prune_model(args, model, mask_info, tokenizer):
         mask_ = mask_info[name]
         if name.endswith('mlp'):
             prune_mlp(mask_, module)
-        elif name.endswith('self_attn'):
-            prune_attn(mask_, module)
+#        elif name.endswith('self_attn'):
+#            prune_attn(mask_, module)
         else:
             raise ValueError("Invalid type found in mask_info : {}".format(name))
 

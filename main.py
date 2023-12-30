@@ -23,6 +23,7 @@ def get_llm(model_name, cache_dir="llm_weights"):
     )
 
     model.seqlen = model.config.max_position_embeddings 
+    model.seqlen = 2048
     return model
 
 def main():

@@ -115,7 +115,7 @@ class ScoreModelHP(object):
 
 	def get_cov_mat(self, xs):
 		variances = (xs.T).matmul(xs) + torch.eye(xs.shape[-1]).cuda()
-		cov_mat = torch.linalg.inv(variances).cpu()
+		cov_mat = torch.linalg.inv(variances.cpu())
 		return cov_mat
 
 	def get_best_fit(self):
@@ -146,7 +146,7 @@ class ScoreModelHP(object):
 			total = preds_.squeeze() + stds_.squeeze()
 # 			print('Totals range : ', total.max().item(), total.min().item())
 			stats = total.mean().item(), total.max().item(), total.min().item()
-			chosen_idx = torch.argsort(total)[-5:]
+			chosen_idx = torch.argsort(total)[-10:]
 			chosen = random_sample[chosen_idx].cpu().half()
 			self.candidate_buffer.extend(chosen.unbind())
 

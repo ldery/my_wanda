@@ -91,7 +91,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_
 			print(e)
 			gc.collect()
 			torch.cuda.empty_cache()
-			this_bsz = 1
+			this_bsz = 2
 			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
 
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
@@ -114,6 +114,8 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_
 
 		if iter_ and (iter_ % fit_cov_every) == 0:
 			# do the covariance model fit here
+			if sm_hp_searcher is not None:
+				del sm_hp_searcher
 			sm_hp_searcher = global_score_fit((all_masks, all_perfs), module_map, hp_dict, return_searcher=True)
 			gc.collect()
 			torch.cuda.empty_cache()

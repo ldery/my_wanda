@@ -19,6 +19,7 @@ from lib.scoring_model import ScoreModelHP
 import wandb
 from transformers.pytorch_utils import  find_pruneable_heads_and_indices, prune_linear_layer
 import gc
+import random
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -207,12 +208,6 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			qt = preset_qt
 
 		mask_ = ((score_model_weights > qt)*1.0).half()
-
-		if mask_.sum() == 0:
-			print('We have encountered a zero sum. Need to fix. Skip Updating this layer')
-			sampling_proba = run_data_to_sampling_proba(info, module, prune_frac)
-			return module.main_mask.mean().item()
-
 		if module.main_mask is not None:
 			module.main_mask *= (mask_).view(info['in'][1].shape)
 		else:
@@ -252,6 +247,10 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
 		if name.endswith('mlp') or name.endswith('self_attn'):
+			# This module has already been fully pruned.
+			if module.skip_computation:
+				continue
+
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
 			id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
 			module_map[id_] = (name, module)
@@ -374,70 +373,81 @@ def get_param_count(model, exclude=['embed', 'head']):
 	return sum([p.numel() for n, p in model.named_parameters() if not any(x in n for x in exclude)])
 
 def prune_mlp(mask_, module):
-	index = mask_.squeeze().nonzero().squeeze()
-	new_gate_proj = (prune_linear_layer(module.gate_proj, index)).half()
-	module.gate_proj = None
-	module.gate_proj = new_gate_proj
-	new_up_proj = (prune_linear_layer(module.up_proj, index)).half()
-	module.up_proj  = None
-	module.up_proj = new_up_proj
-	new_down_proj = (prune_linear_layer(module.down_proj, index, dim=1)).half()
-	module.down_proj = None
-	module.down_proj = new_down_proj
+	# Reset pruning related information
 	module.main_mask = None
 	module.temp_mask = None
 	module.intermed_cache = None
-	module.intermediate_size = len(index)
-
-	if len(index) == 0:
-		print("We are pruning the whole layer mlp")
-		# alert to skip computation for this module
-		module.skip_computation = True
-
 	module.ins_ = None
+
+	if mask_.mean() == 0: # We are pruning the whole module here !
+		print("We are pruning the whole mlp layer")
+		module.gate_proj = None
+		module.up_proj   = None
+		module.down_proj = None
+		module.intermediate_size = 0
+		module.skip_computation = True
+	else:
+		index = mask_.squeeze().nonzero().squeeze()
+		new_gate_proj = (prune_linear_layer(module.gate_proj, index)).half()
+		module.gate_proj = None
+		module.gate_proj = new_gate_proj
+		new_up_proj = (prune_linear_layer(module.up_proj, index)).half()
+		module.up_proj  = None
+		module.up_proj = new_up_proj
+		new_down_proj = (prune_linear_layer(module.down_proj, index, dim=1)).half()
+		module.down_proj = None
+		module.down_proj = new_down_proj
+		module.intermediate_size = len(index)
+
 	gc.collect()
 	torch.cuda.empty_cache()
 
 def prune_attn(mask_, module):
-	index = (mask_.squeeze() == 0).nonzero().squeeze()
-
-	if index.numel() < 2:
-		if index.numel() == 0: return # we are not pruning anything here
-		index = [index]
-
-	_, updated_indices = find_pruneable_heads_and_indices(
-		index, module.num_heads, module.head_dim, set()
-	)
-
-	new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
-	module.q_proj = None
-	module.q_proj = new_q_proj
-	
-	new_k_proj = (prune_linear_layer(module.k_proj, updated_indices)).half()
-	module.k_proj = None
-	module.k_proj = new_k_proj
-
-	new_v_proj = (prune_linear_layer(module.v_proj, updated_indices)).half()
-	module.v_proj = None
-	module.v_proj = new_v_proj
-
-	new_o_proj = (prune_linear_layer(module.o_proj, updated_indices, dim=1)).half()
-	module.o_proj = None
-	module.o_proj = new_o_proj
-
-	module.num_heads = len(mask_.squeeze().nonzero())
-	module.hidden_size = module.num_heads * module.head_dim
 
 	module.main_mask = None
 	module.temp_mask = None
 	module.intermed_cache = None
-	module.intermediate_size = module.num_heads
 	module.ins_ = None
 
-	if len(updated_indices) == 0:
-		print("We are pruning the whole layer attn")
-		# alert to skip computation for this module
+	if mask_.mean() == 0: # We are pruning the whole module here !
+		print('We are pruning a whole attention layer')
+		module.q_proj = None
+		module.k_proj = None
+		module.v_proj = None
+		module.o_proj = None
 		module.skip_computation = True
+		module.num_heads = 0
+		module.hidden_size = 0
+		module.intermediate_size = 0
+	else:
+		index = (mask_.squeeze() == 0).nonzero().squeeze()
+		if index.numel() == 1:
+			index = [index]
+
+		_, updated_indices = find_pruneable_heads_and_indices(
+			index, module.num_heads, module.head_dim, set()
+		)
+
+		new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
+		module.q_proj = None
+		module.q_proj = new_q_proj
+
+		new_k_proj = (prune_linear_layer(module.k_proj, updated_indices)).half()
+		module.k_proj = None
+		module.k_proj = new_k_proj
+
+		new_v_proj = (prune_linear_layer(module.v_proj, updated_indices)).half()
+		module.v_proj = None
+		module.v_proj = new_v_proj
+
+		new_o_proj = (prune_linear_layer(module.o_proj, updated_indices, dim=1)).half()
+		module.o_proj = None
+		module.o_proj = new_o_proj
+
+		module.num_heads = len(mask_.squeeze().nonzero())
+		module.hidden_size = module.num_heads * module.head_dim
+		module.intermediate_size = module.num_heads
+
 
 	gc.collect()
 	torch.cuda.empty_cache() 
@@ -514,7 +524,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
 
 	original_param_count = get_param_count(model)

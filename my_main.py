@@ -31,6 +31,7 @@ INF = 1e8
 def set_masks(module_map, all_masks, all_sampling_proba, mask_to_use=None, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
 	start_ = 0
 	for k, (name, module) in module_map.items():
+		this_pfrac = pfrac
 		if name.endswith('self_attn'):
 			this_pfrac = pfrac * mlp_attn_ratio
 
@@ -559,7 +560,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device)
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
 
 	original_param_count = get_param_count(model)

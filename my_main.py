@@ -563,7 +563,7 @@ def main():
 	start_time = time()
 	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
-	pdb.set_trace()
+	print('This is the original test ppl : ', orig_test_ppl)
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count

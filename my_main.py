@@ -10,6 +10,7 @@ import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
 from lib.modelling_llama_mod import LlamaForCausalLM
+from lib.modeling_phi_mod import PhiForCausalLM
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly
 from collections import defaultdict
@@ -129,7 +130,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_
 	return all_masks, all_perfs
 
 def get_llm(model_name, cache_dir="llm_weights"):
-	model = LlamaForCausalLM.from_pretrained(
+	model = PhiForCausalLM.from_pretrained(
 		model_name, 
 		torch_dtype=torch.float16, 
 		cache_dir=cache_dir, 
@@ -507,7 +508,7 @@ def prune_model(args, model, mask_info, tokenizer):
 
 def main():
 	parser = argparse.ArgumentParser()
-	parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf', help='LLaMA model') # huggyllama/llama-7b
+	parser.add_argument('--model', type=str, default='microsoft/phi-2', help='Microsoft model') # huggyllama/llama-7b
 	parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
 	parser.add_argument('--nsamples', type=int, default=14, help='Number of calibration samples.')
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
@@ -558,10 +559,11 @@ def main():
 	model = get_llm(args.model, args.cache_dir)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-	
+	print(model)
 	start_time = time()
 	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
 	original_runtime = time() - start_time
+	pdb.set_trace()
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count

@@ -114,7 +114,8 @@ class ScoreModelHP(object):
 		torch.cuda.empty_cache()
 
 	def get_cov_mat(self, xs):
-		variances = (xs.T).matmul(xs) + torch.eye(xs.shape[-1]).cuda()
+		xs = xs.cpu()
+		variances = (xs.T).matmul(xs) + torch.eye(xs.shape[-1])
 		cov_mat = torch.linalg.inv(variances.cpu())
 		return cov_mat
 

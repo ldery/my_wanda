@@ -30,6 +30,7 @@ INF = 1e8
 
 def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
 	for k, (name, module) in module_map.items():
+		this_pfrac = pfrac
 		if name.endswith('self_attn'):
 			this_pfrac = pfrac * mlp_attn_ratio
 

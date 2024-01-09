@@ -33,7 +33,7 @@ def set_masks(module_map, all_masks, all_sampling_proba, mask_to_use=None, pfrac
 	start_ = 0
 	for k, (name, module) in module_map.items():
 		this_pfrac = pfrac
-		if name.endswith('self_attn'):
+		if name.endswith('mixer'):
 			this_pfrac = pfrac * mlp_attn_ratio
 
 		module.is_using_main = False
@@ -61,11 +61,11 @@ def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	non_zero_idxs = np.squeeze(init_set).nonzero()[0]
 	new_proba = sampling_proba[non_zero_idxs]
 	new_proba = new_proba / np.sum(new_proba)
-	chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba)
+	chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba, replace=False)
 	init_set[:, :, chosen_idxs] = 0
 	return init_set
 
-def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_dict=None, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0, fit_cov_every=0.3):
+def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_dict=None, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0, dataset_="c4"):
 
 	# set to use main
 	for k, (name, module) in module_map.items():
@@ -73,29 +73,20 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_
 
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
 	seed_ = random.randint(0, 1e4)
-	fit_cov_every = int((mpi // 2) * fit_cov_every)
 	sm_hp_searcher = None
-	this_list = []
 	for iter_ in range(mpi // 2):
 		this_bsz = bsz
-
-		# set the layer mask here
-		mask_to_use = None
-		if sm_hp_searcher is not None:
-			mask_to_use = sm_hp_searcher.get_candidate()
-			this_list.append(mask_to_use)
-
-		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, mask_to_use=mask_to_use)
+		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, mask_to_use=None)
 
 		# TODO (clean up with a wrapper since this is repeated code)
 		try:
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 		except Exception as e:
 			print(e)
 			gc.collect()
 			torch.cuda.empty_cache()
 			this_bsz = 2
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
@@ -106,7 +97,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_
 
 		# set the complement mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, use_complement=True)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 
 		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
@@ -114,14 +105,6 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, hp_
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
-
-		if iter_ and (iter_ % fit_cov_every) == 0:
-			# do the covariance model fit here
-			if sm_hp_searcher is not None:
-				del sm_hp_searcher
-			sm_hp_searcher = global_score_fit((all_masks, all_perfs), module_map, hp_dict, return_searcher=True)
-			gc.collect()
-			torch.cuda.empty_cache()
 
 	# reset to use main
 	for k, (name, module) in module_map.items():
@@ -255,7 +238,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
 			this_prune_frac = prune_frac
-			if name.endswith('self_attn'):
+			if name.endswith('mixer'):
 				this_prune_frac = prune_frac * mlp_attn_ratio
 
 			_, fixed_indices, use_indices = all_sampling_proba[id_]
@@ -282,13 +265,13 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	info_cache, hook_handles = defaultdict(dict), []
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
-		if name.endswith('mlp') or name.endswith('self_attn'):
+		if name.endswith('mlp') or name.endswith('mixer'):
 			# This module has already been fully pruned.
 			if module.skip_computation:
 				continue
 
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
-			id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
+			id_  = '{}.{}'.format('mixer' if name.endswith('mixer') else 'mlp', int(name.split('.')[2]))
 			module_map[id_] = (name, module)
 			intermediate_sz = module.intermediate_size
 			# set the module prune type here
@@ -298,19 +281,19 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	try:
-		eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+		eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples, dataset=args.dataset)
 	except Exception as e:
 		print(e)
 		gc.collect()
 		torch.cuda.empty_cache()
-		eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=args.nsamples)
+		eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=args.nsamples, dataset=args.dataset)
 
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
 	for id_, (name, module) in module_map.items():
 		this_pfrac = args.prune_frac
-		if name.endswith('self_attn'):
+		if name.endswith('mixer'):
 			this_pfrac = this_pfrac * args.mlp_attn_ratio
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
@@ -323,7 +306,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	score_info = get_random_mask_scores(
 						model, tokenizer, module_map, all_sampling_proba,
 						bsz=args.bsz, nsamples=args.nsamples, hp_dict=hp_dict,
-						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
+						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio,
+						dataset_=args.dataset
 	)
 	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
 	gen_scores_time = time() - start
@@ -331,15 +315,16 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	# Need to do some fitting to a linear model here.
 	preset_qt = None
 	if args.sm_lin_model_type == 'global':
+		# [LD] -- I've double checked this code to make sure it is doing the right thing!
 		best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
 		init_param_counts = np.zeros_like(best_fit)
 		start_idx = 0
 		for id_, (name, module) in module_map.items():
 			num_entries =  len(score_info[0][id_][0])
 			if name.endswith('mlp'):
-				init_param_counts[start_idx: (start_idx + num_entries)] = model.model.params_per_pruned_hidden
+				init_param_counts[start_idx: (start_idx + num_entries)] = model.params_per_pruned_hidden
 			else:
-				init_param_counts[start_idx: (start_idx + num_entries)] = model.model.params_per_pruned_head
+				init_param_counts[start_idx: (start_idx + num_entries)] = model.params_per_pruned_head
 			start_idx += num_entries
 
 		sort_idxs = np.argsort(best_fit)
@@ -415,25 +400,20 @@ def prune_mlp(mask_, module):
 	module.temp_mask = None
 	module.intermed_cache = None
 	module.ins_ = None
-
 	if mask_.mean() == 0: # We are pruning the whole module here !
 		print("We are pruning the whole mlp layer")
-		module.gate_proj = None
-		module.up_proj   = None
-		module.down_proj = None
+		module.fc1 = None
+		module.fc2   = None
 		module.intermediate_size = 0
 		module.skip_computation = True
 	else:
 		index = mask_.squeeze().nonzero().squeeze()
-		new_gate_proj = (prune_linear_layer(module.gate_proj, index)).half()
-		module.gate_proj = None
-		module.gate_proj = new_gate_proj
-		new_up_proj = (prune_linear_layer(module.up_proj, index)).half()
-		module.up_proj  = None
-		module.up_proj = new_up_proj
-		new_down_proj = (prune_linear_layer(module.down_proj, index, dim=1)).half()
-		module.down_proj = None
-		module.down_proj = new_down_proj
+		fc1 = (prune_linear_layer(module.fc1, index)).half()
+		module.fc1 = None
+		module.fc1 = fc1
+		fc2 = (prune_linear_layer(module.fc2, index, dim=1)).half()
+		module.fc2  = None
+		module.fc2 = fc2
 		module.intermediate_size = len(index)
 
 	gc.collect()
@@ -448,12 +428,10 @@ def prune_attn(mask_, module):
 
 	if mask_.mean() == 0: # We are pruning the whole module here !
 		print('We are pruning a whole attention layer')
-		module.q_proj = None
-		module.k_proj = None
-		module.v_proj = None
-		module.o_proj = None
+		module.Wqkv  = None
+		module.out_proj = None
 		module.skip_computation = True
-		module.num_heads = 0
+		module.n_head = 0
 		module.hidden_size = 0
 		module.intermediate_size = 0
 	else:
@@ -462,28 +440,24 @@ def prune_attn(mask_, module):
 			index = [index]
 
 		_, updated_indices = find_pruneable_heads_and_indices(
-			index, module.num_heads, module.head_dim, set()
+			index, module.n_head, module.head_dim, set()
 		)
 
-		new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
-		module.q_proj = None
-		module.q_proj = new_q_proj
+		if module.n_head_kv != module.n_head:
+			raise NotImplementedError("We have not implemented pruning for the case where the kqv have different sizes")
+		
+		new_oproj = (prune_linear_layer(module.out_proj, updated_indices, dim=1)).half()
+		module.out_proj = None
+		module.out_proj = new_oproj
+		
+		updated_indices = torch.concatenate([updated_indices, updated_indices + (module.n_head * module.head_dim), updated_indices + (2 * module.n_head * module.head_dim)])
+		new_Wqkv = (prune_linear_layer(module.Wqkv, updated_indices)).half()
+		module.Wqkv = None
+		module.Wqkv = new_Wqkv
 
-		new_k_proj = (prune_linear_layer(module.k_proj, updated_indices)).half()
-		module.k_proj = None
-		module.k_proj = new_k_proj
-
-		new_v_proj = (prune_linear_layer(module.v_proj, updated_indices)).half()
-		module.v_proj = None
-		module.v_proj = new_v_proj
-
-		new_o_proj = (prune_linear_layer(module.o_proj, updated_indices, dim=1)).half()
-		module.o_proj = None
-		module.o_proj = new_o_proj
-
-		module.num_heads = len(mask_.squeeze().nonzero())
-		module.hidden_size = module.num_heads * module.head_dim
-		module.intermediate_size = module.num_heads
+		module.n_head = module.n_head_kv = len(mask_.squeeze().nonzero())
+		module.hidden_size = module.n_head * module.head_dim
+		module.intermediate_size = module.n_head
 
 
 	gc.collect()
@@ -497,7 +471,7 @@ def prune_model(args, model, mask_info, tokenizer):
 		mask_ = mask_info[name]
 		if name.endswith('mlp'):
 			prune_mlp(mask_, module)
-		elif name.endswith('self_attn'):
+		elif name.endswith('mixer'):
 			prune_attn(mask_, module)
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
@@ -509,6 +483,7 @@ def prune_model(args, model, mask_info, tokenizer):
 def main():
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--model', type=str, default='microsoft/phi-2', help='Microsoft model') # huggyllama/llama-7b
+	parser.add_argument('--dataset', type=str, default='c4', choices=["wikitext2", "c4"])
 	parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
 	parser.add_argument('--nsamples', type=int, default=14, help='Number of calibration samples.')
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
@@ -559,9 +534,9 @@ def main():
 	model = get_llm(args.model, args.cache_dir)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-	print(model)
+
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+	_, orig_test_ppl =  -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
 	print('This is the original test ppl : ', orig_test_ppl)
 
@@ -592,7 +567,7 @@ def main():
 
 		# Evaluate the performance of the pruned model
 		start_time = time()
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 		pruned_model_runtime = time() - start_time
 
 		wandb_run.log({

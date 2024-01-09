@@ -243,6 +243,7 @@ class LlamaAttention(nn.Module):
 			attn_output = attn_output * self.temp_mask
 
 		if self.prune_method == "magnitude":
+			# TODO [ldery] -- need to fix this asap !
 			with torch.no_grad():
 				self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
 		elif self.prune_method == "wanda":

@@ -214,7 +214,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			regression_weights = (info['in'][1] / info['in'][0]).squeeze()
 
 		# bias this so that we do not remove any of the fixed indices
-		score_model_weights[fixed_indices] = regression_weights.max()
+		score_model_weights[fixed_indices] = INF
 		score_model_weights[use_indices] = regression_weights
 
 
@@ -536,7 +536,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	start_time = time()
-	_, orig_test_ppl =  -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
 	print('This is the original test ppl : ', orig_test_ppl)
 

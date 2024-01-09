@@ -99,8 +99,8 @@ class ScoreModelHP(object):
 
 		self.best_fit_model = (sm.base_model.score_tensor.clone().squeeze()).detach()
 
-		(xs, ys), _ = this_run_info
-		self.cov_mat = self.get_cov_mat(torch.stack(xs).cuda())
+# 		(xs, ys), _ = this_run_info
+# 		self.cov_mat = self.get_cov_mat(torch.stack(xs).cuda())
 		self.best_fit_stats = results_info
 
 		del sm

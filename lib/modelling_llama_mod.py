@@ -247,10 +247,8 @@ class LlamaAttention(nn.Module):
 				self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
 		elif self.prune_method == "wanda":
 			with torch.no_grad():
-				if self.ins_ is None:
-					self.ins_ = self.o_proj.weight.data.to(torch.float32).abs()
 				ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
-				ins_ = self.ins_ * ins_.pow(2).mean(0, keepdim=True).sqrt()
+				ins_ = (self.o_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
 				self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
@@ -309,11 +307,8 @@ class LlamaMLP(nn.Module):
 			if self.prune_method == "magnitude":
 				self.intermed_cache = intermed_result.abs().view(-1, last_dim).mean(axis=0, keepdims=True).view(1, 1, -1)
 			elif self.prune_method == "wanda":
-				if self.ins_ is None:
-					self.ins_ = self.down_proj.weight.data.to(torch.float32).abs()
-
 				ins_ = intermed_result.view(-1, last_dim).to(torch.float32)
-				ins_ = self.ins_ * ins_.pow(2).mean(0, keepdim=True).sqrt()
+				ins_ = (self.down_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
 				self.intermed_cache = ins_.mean(axis=0).view(1, 1, -1)
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Stopping")

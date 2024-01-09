@@ -111,8 +111,9 @@ def get_llm(model_name, cache_dir="llm_weights"):
 		low_cpu_mem_usage=True, 
 		device_map="auto"
 	)
-
 	model.seqlen = model.config.max_position_embeddings 
+	if ('13b' in model_name) or ('65b' in model_name):
+		model.seqlen = 2048 #Based on the values from the Lora-prune paper
 	return model
 
 def hook_fn(module_name, info_cache):
@@ -196,7 +197,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			regression_weights = (info['in'][1] / info['in'][0]).squeeze()
 
 		# bias this so that we do not remove any of the fixed indices
-		score_model_weights[fixed_indices] = regression_weights.max()
+		score_model_weights[fixed_indices] = INF
 		score_model_weights[use_indices] = regression_weights
 
 

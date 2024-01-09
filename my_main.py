@@ -51,7 +51,7 @@ def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	non_zero_idxs = np.squeeze(init_set).nonzero()[0]
 	new_proba = sampling_proba[non_zero_idxs]
 	new_proba = new_proba / np.sum(new_proba)
-	chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba)
+	chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba, replace=False)
 	init_set[:, :, chosen_idxs] = 0
 	return init_set
 

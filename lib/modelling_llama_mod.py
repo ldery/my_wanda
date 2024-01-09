@@ -304,6 +304,7 @@ class LlamaMLP(nn.Module):
 			intermed_result = intermed_result * self.temp_mask
 
 		last_dim = intermed_result.shape[-1]
+
 		with torch.no_grad():
 			if self.prune_method == "magnitude":
 				self.intermed_cache = intermed_result.abs().view(-1, last_dim).mean(axis=0, keepdims=True).view(1, 1, -1)
@@ -311,7 +312,8 @@ class LlamaMLP(nn.Module):
 				if self.ins_ is None:
 					self.ins_ = self.down_proj.weight.data.to(torch.float32).abs()
 
-				ins_ = self.ins_ * intermed_result.view(-1, last_dim).to(torch.float32).pow(2).mean(0, keepdim=True).sqrt()
+				ins_ = intermed_result.view(-1, last_dim).to(torch.float32)
+				ins_ = self.ins_ * ins_.pow(2).mean(0, keepdim=True).sqrt()
 				self.intermed_cache = ins_.mean(axis=0).view(1, 1, -1)
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Stopping")

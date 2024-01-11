@@ -548,6 +548,14 @@ def main():
 		if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
 			break
 
+		# Need to check if we have to clip the sparsity ratio
+		if (cur_sparsity + args.prune_frac) > args.sparsity_ratio:
+			# We would overshoot in this case which is not idea.
+			old_prune_frac = args.prune_frac
+			args.prune_frac = abs(args.sparsity_ratio - cur_sparsity)
+			print('We have updated the prune fraction {:.3f} -> {:.3f} to avoid overshooting'.format(old_prune_frac, args.prune_frac))
+
+
 		print('Gathering statistics for pruning')
 		save_loc = os.path.join(args.save, 'mask_info_{}.pkl'.format(epoch_))
 		if os.path.exists(save_loc):

@@ -7,9 +7,7 @@ import pdb
 from .data import get_loaders 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
-	# Set dataset
-	dataset = "wikitext2"
+def eval_ppl(model, tokenizer, device=torch.device("cuda:0"), dataset="wikitext2"):
 
 	# Print status
 	print(f"evaluating on {dataset}")
@@ -21,15 +19,14 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
 
 	# Evaluate ppl in no grad context to avoid updating the model
 	with torch.no_grad():
-		ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
-		ppl_train = eval_ppl_wikitext_train(model, trainloader, 1, device)
+		ppl_test = eval_ppl_test(model, testloader, 1, device)
+		ppl_train = eval_ppl_train(model, trainloader, 1, device)
 	return ppl_train, ppl_test 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0"), seed=0):
-	# Set dataset
-	dataset = "wikitext2"
+def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0"), seed=0, dataset="wikitext2"):
 
+	print(f"evaluating on {dataset}")
 	# Get the test loader
 	trainloader, _ = get_loaders(
 		dataset, nsamples=nsamples, seed=seed, seqlen=model.seqlen, tokenizer=tokenizer 
@@ -37,11 +34,11 @@ def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.devic
 
 	# Evaluate ppl in no grad context to avoid updating the model
 	with torch.no_grad():
-		ppl_train = eval_ppl_wikitext_train(model, trainloader, bsz, device)
+		ppl_train = eval_ppl_train(model, trainloader, bsz, device)
 	return ppl_train
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
-def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
+def eval_ppl_train(model, trainloader, bs=1, device=None):
 	# Get input IDs
 	# testenc = testenc.input_ids
 
@@ -94,7 +91,7 @@ def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
 	return ppl.item()
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
-def eval_ppl_wikitext(model, testenc, bs=1, device=None):
+def eval_ppl_test(model, testenc, bs=1, device=None):
 	# Get input IDs
 	testenc = testenc.input_ids
 

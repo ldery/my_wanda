@@ -55,7 +55,7 @@ def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set[:, :, chosen_idxs] = 0
 	return init_set
 
-def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
+def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0, dataset_="wikitext2"):
 
 	# set to use main
 	for k, (name, module) in module_map.items():
@@ -71,13 +71,13 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 		# TODO (clean up with a wrapper since this is repeated code)
 		try:
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 		except Exception as e:
 			print(e)
 			gc.collect()
 			torch.cuda.empty_cache()
 			this_bsz = 1
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
@@ -88,7 +88,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 		# set the complement mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, use_complement=True)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_)
+		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 
 		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
@@ -264,12 +264,12 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	try:
-		eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples)
+		eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples, dataset=args.dataset)
 	except Exception as e:
 		print(e)
 		gc.collect()
 		torch.cuda.empty_cache()
-		eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=args.nsamples)
+		eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=args.nsamples, dataset=args.dataset)
 
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
@@ -289,7 +289,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	score_info = get_random_mask_scores(
 						model, tokenizer, module_map, all_sampling_proba,
 						bsz=args.bsz, nsamples=args.nsamples,
-						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
+						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio,
+						dataset_=args.dataset
 	)
 	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
 	gen_scores_time = time() - start
@@ -474,6 +475,7 @@ def prune_model(args, model, mask_info, tokenizer):
 def main():
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf', help='LLaMA model') # huggyllama/llama-7b
+	parser.add_argument('--dataset', type=str, default="wikitext2", choices=["wikitext2", "c4"])
 	parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
 	parser.add_argument('--nsamples', type=int, default=14, help='Number of calibration samples.')
 	parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
@@ -526,7 +528,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device)
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
 
 	original_param_count = get_param_count(model)
@@ -564,7 +566,7 @@ def main():
 
 		# Evaluate the performance of the pruned model
 		start_time = time()
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device)
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 		pruned_model_runtime = time() - start_time
 
 		wandb_run.log({

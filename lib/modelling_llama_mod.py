@@ -254,6 +254,8 @@ class LlamaAttention(nn.Module):
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Resettinig ")
 					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+		elif self.prune_method == "random":
+			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(hidden_states.device)
 
 		attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
@@ -313,6 +315,8 @@ class LlamaMLP(nn.Module):
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Stopping")
 					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+			elif self.prune_method == "random":
+				self.intermed_cache = torch.rand((1, 1, self.intermediate_size)).to(x.device)
 
 		return self.down_proj(intermed_result)
 

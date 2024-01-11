@@ -483,7 +483,7 @@ def main():
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
 	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
 
-	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda"])
+	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
 	parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
 	parser.add_argument('--save', type=str, default=None, help='Path to save results.')

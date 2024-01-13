@@ -195,11 +195,11 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
 		if regression_weights is None:
 			regression_weights = (info['in'][1] / info['in'][0]).squeeze()
+			regression_weights = regression_weights[use_indices]
 
 		# bias this so that we do not remove any of the fixed indices
 		score_model_weights[fixed_indices] = INF
 		score_model_weights[use_indices] = regression_weights
-
 
 		if preset_qt is None:
 			if module.main_mask is not None:
@@ -214,10 +214,9 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			module.main_mask *= (mask_).view(info['in'][1].shape)
 		else:
 			module.main_mask = (mask_).view(info['in'][1].shape)
-
 		return module.main_mask.mean().item()
 
-	def compute_updated_masks_local(prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=1.0, preset_qt=None):
+	def compute_updated_masks_local(prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=1.0, preset_qt=None, no_regression=False):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
 			this_prune_frac = prune_frac
@@ -225,7 +224,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 				this_prune_frac = prune_frac * mlp_attn_ratio
 
 			_, fixed_indices, use_indices = all_sampling_proba[id_]
-			score_model = None if score_model_maps is None else score_model_maps[id_]
+			score_model = None if ((score_model_maps is None) or (no_regression)) else score_model_maps[id_]
 			this_avg = update_mask_one_layer(
 										module, info_cache[name], 
 										score_matrix[id_], this_prune_frac,
@@ -297,7 +296,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	start = time()
 	# Need to do some fitting to a linear model here.
 	preset_qt = None
-	if args.sm_lin_model_type == 'global':
+	if args.sm_lin_model_type == 'global' and (args.sm_nepochs > 0):
 		best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
 		init_param_counts = np.zeros_like(best_fit)
 		start_idx = 0
@@ -324,7 +323,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			start_idx += num_entries
 		preset_qt = 0
 
-	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt)
+	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt, no_regression=(args.sm_nepochs == 0))
 	time_delta = time() - start
 	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}

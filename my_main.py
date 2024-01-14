@@ -10,7 +10,7 @@ import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
 from lib.modelling_llama_mod import LlamaForCausalLM
-from lib.modeling_phi_mod import PhiForCausalLM
+from lib.modelling_phi_mod_2 import PhiForCausalLM
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly
 from collections import defaultdict
@@ -33,7 +33,7 @@ def set_masks(module_map, all_masks, all_sampling_proba, mask_to_use=None, pfrac
 	start_ = 0
 	for k, (name, module) in module_map.items():
 		this_pfrac = pfrac
-		if name.endswith('mixer'):
+		if name.endswith('self_attn'):
 			this_pfrac = pfrac * mlp_attn_ratio
 
 		module.is_using_main = False
@@ -118,7 +118,8 @@ def get_llm(model_name, cache_dir="llm_weights"):
 		torch_dtype=torch.float16, 
 		cache_dir=cache_dir, 
 		low_cpu_mem_usage=True, 
-		device_map="auto"
+		device_map="auto",
+		trust_remote_code=True
 	)
 
 	model.seqlen = model.config.max_position_embeddings 
@@ -238,7 +239,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		avgs = 0.0
 		for id_, (name, module) in module_map.items():
 			this_prune_frac = prune_frac
-			if name.endswith('mixer'):
+			if name.endswith('self_attn'):
 				this_prune_frac = prune_frac * mlp_attn_ratio
 
 			_, fixed_indices, use_indices = all_sampling_proba[id_]
@@ -265,13 +266,13 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	info_cache, hook_handles = defaultdict(dict), []
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
-		if name.endswith('mlp') or name.endswith('mixer'):
+		if name.endswith('mlp') or name.endswith('self_attn'):
 			# This module has already been fully pruned.
 			if module.skip_computation:
 				continue
 
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
-			id_  = '{}.{}'.format('mixer' if name.endswith('mixer') else 'mlp', int(name.split('.')[2]))
+			id_  = '{}.{}'.format('self_attn' if name.endswith('self_attn') else 'mlp', int(name.split('.')[2]))
 			module_map[id_] = (name, module)
 			intermediate_sz = module.intermediate_size
 			# set the module prune type here
@@ -293,7 +294,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
 	for id_, (name, module) in module_map.items():
 		this_pfrac = args.prune_frac
-		if name.endswith('mixer'):
+		if name.endswith('self_attn'):
 			this_pfrac = this_pfrac * args.mlp_attn_ratio
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
@@ -428,10 +429,12 @@ def prune_attn(mask_, module):
 
 	if mask_.mean() == 0: # We are pruning the whole module here !
 		print('We are pruning a whole attention layer')
-		module.Wqkv  = None
-		module.out_proj = None
+		module.q_proj = None
+		module.k_proj = None
+		module.v_proj = None
+		module.dense = None
 		module.skip_computation = True
-		module.n_head = 0
+		module.num_heads = 0
 		module.hidden_size = 0
 		module.intermediate_size = 0
 	else:
@@ -440,25 +443,29 @@ def prune_attn(mask_, module):
 			index = [index]
 
 		_, updated_indices = find_pruneable_heads_and_indices(
-			index, module.n_head, module.head_dim, set()
+			index, module.num_heads, module.head_dim, set()
 		)
 
-		if module.n_head_kv != module.n_head:
-			raise NotImplementedError("We have not implemented pruning for the case where the kqv have different sizes")
-		
-		new_oproj = (prune_linear_layer(module.out_proj, updated_indices, dim=1)).half()
-		module.out_proj = None
-		module.out_proj = new_oproj
-		
-		updated_indices = torch.concatenate([updated_indices, updated_indices + (module.n_head * module.head_dim), updated_indices + (2 * module.n_head * module.head_dim)])
-		new_Wqkv = (prune_linear_layer(module.Wqkv, updated_indices)).half()
-		module.Wqkv = None
-		module.Wqkv = new_Wqkv
+		new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
+		module.q_proj = None
+		module.q_proj = new_q_proj
 
-		module.n_head = module.n_head_kv = len(mask_.squeeze().nonzero())
-		module.hidden_size = module.n_head * module.head_dim
-		module.intermediate_size = module.n_head
+		new_k_proj = (prune_linear_layer(module.k_proj, updated_indices)).half()
+		module.k_proj = None
+		module.k_proj = new_k_proj
 
+		new_v_proj = (prune_linear_layer(module.v_proj, updated_indices)).half()
+		module.v_proj = None
+		module.v_proj = new_v_proj
+
+		new_o_proj = (prune_linear_layer(module.dense, updated_indices, dim=1)).half()
+		module.dense = None
+		module.dense = new_o_proj
+		
+		module.num_heads = len(mask_.squeeze().nonzero())
+		module.hidden_size = module.num_heads * module.head_dim
+		module.num_key_value_heads = module.num_heads
+		module.intermediate_size = module.num_heads
 
 	gc.collect()
 	torch.cuda.empty_cache() 
@@ -471,7 +478,7 @@ def prune_model(args, model, mask_info, tokenizer):
 		mask_ = mask_info[name]
 		if name.endswith('mlp'):
 			prune_mlp(mask_, module)
-		elif name.endswith('mixer'):
+		elif name.endswith('self_attn'):
 			prune_attn(mask_, module)
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))

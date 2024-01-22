@@ -432,6 +432,8 @@ def prune_attn(mask_, module):
 		new_q_proj = (prune_linear_layer(module.q_proj, updated_indices)).half()
 		module.q_proj = None
 		module.q_proj = new_q_proj
+		
+		# keep index  (1, 5, 7) out of the 8 indices.... then you keep (4x ... 4x + 4)
 
 		new_k_proj = (prune_linear_layer(module.k_proj, updated_indices)).half()
 		module.k_proj = None

@@ -257,7 +257,7 @@ class MistralAttention(nn.Module):
         self.is_using_main = True
         self.intermed_cache = None
         self.prune_method = None
-        self.intermediate_size = self.num_heads
+        self.intermediate_size = self.num_key_value_heads  #self.num_heads
         self.skip_computation = False
         self.ins_ = None
 
@@ -333,19 +333,22 @@ class MistralAttention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2)
         if self.is_using_main and (self.main_mask is not None):
-            attn_output = attn_output * self.main_mask
+			# Lucio made change -- replicate for temp_mask
+            attn_output = attn_output * repeat_kv(self.main_mask.transpose(1, 2))
         elif (self.temp_mask is not None):
             attn_output = attn_output * self.temp_mask
 
         if self.prune_method == "magnitude":
             with torch.no_grad():
-                self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
+				# modified by lucio -- you should double check
+                self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).reshape(-1, self.num_key_value_heads, -1).transpose(1, 2).mean(axis=0, keepdims=True).view(1, 1, self.num_key_value_heads, 1)
         elif self.prune_method == "wanda":
             with torch.no_grad():
                 if self.ins_ is None:
                     self.ins_ = self.o_proj.weight.data.to(torch.float32).abs()
                 ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
                 ins_ = self.ins_ * ins_.pow(2).mean(0, keepdim=True).sqrt()
+				# TODO [steven] do something similar as above here.
                 self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 
                 if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Set common variables
-model="decapoda-research/llama-7b-hf"
+model="mistralai/Mistral-7B-v0.1"
 sparsity_ratio=0.5
 cuda_device=0
 
@@ -10,7 +10,7 @@ export CUDA_VISIBLE_DEVICES=$cuda_device
 
 # Define function to run python command
 run_python_command () {
-    python main.py \
+    python my_main.py \
     --model $model \
     --prune_method $1 \
     --sparsity_ratio $sparsity_ratio \

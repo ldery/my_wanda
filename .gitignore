@@ -2,3 +2,11 @@
 .env
 *.pyc
 *.DS_Store
+lib/.ipynb_checkpoints/
+llm_weights/
+mistral_wanda_results.csv
+out/
+process_results.sh
+wandb/
+
+

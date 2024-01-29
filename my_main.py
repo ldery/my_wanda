@@ -171,7 +171,7 @@ def run_data_to_sampling_proba(info, module, pfrac):
 	avg_act_magnitudes = info['in'][1] / info['in'][0]
 	sampling_proba = avg_act_magnitudes.cpu().squeeze().numpy()
 
-	num_keep_static = int(len(sampling_proba)*(1.0 - 2*pfrac)) # hard coded to look at 2x the original pruning fraction
+	num_keep_static = 0 if pfrac is None else int(len(sampling_proba)*(1.0 - 2*pfrac)) # hard coded to look at 2x the original pruning fraction
 	sorted_ = np.argsort(-sampling_proba)
 	fixed_indices, use_indices = sorted_[:num_keep_static], sorted_[num_keep_static:]
 
@@ -225,9 +225,10 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 			_, fixed_indices, use_indices = all_sampling_proba[id_]
 			score_model = None if ((score_model_maps is None) or (no_regression)) else score_model_maps[id_]
+			score_matrix_entry = score_matrix[id_] if score_matrix is not None else None
 			this_avg = update_mask_one_layer(
 										module, info_cache[name], 
-										score_matrix[id_], this_prune_frac,
+										score_matrix_entry, this_prune_frac,
 										score_model, fixed_indices, use_indices, preset_qt=preset_qt)
 			avgs += this_avg
 
@@ -277,26 +278,35 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 		this_pfrac = args.prune_frac
 		if name.endswith('self_attn'):
 			this_pfrac = this_pfrac * args.mlp_attn_ratio
+		this_pfrac = None if args.no_perturb else this_pfrac
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
 
-	# Clear the info-cache for the next round !
-	for k, v in info_cache.items():
-		info_cache[k] = dict()
+	if not args.no_perturb: # We are not running a perturbation algorithm
+		# Clear the info-cache for the next round !
+		for k, v in info_cache.items():
+			info_cache[k] = dict()
 
-	start = time()
-	score_info = get_random_mask_scores(
-						model, tokenizer, module_map, all_sampling_proba,
-						bsz=args.bsz, nsamples=args.nsamples,
-						mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio,
-						dataset_=args.dataset
-	)
-	score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
-	gen_scores_time = time() - start
-	start = time()
+		start = time()
+		score_info = get_random_mask_scores(
+							model, tokenizer, module_map, all_sampling_proba,
+							bsz=args.bsz, nsamples=args.nsamples,
+							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio,
+							dataset_=args.dataset
+		)
+		gen_scores_time = time() - start
+		start = time()
+		score_model_maps = get_score_models(score_info, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='Iter.{}'.format(epoch_), model_type=args.sm_lin_model_type)
+		time_delta = time() - start
+	else:
+		gen_scores_time = 0
+		time_delta = 0
+		score_model_maps = None
+		score_matrix = None
+
 	# Need to do some fitting to a linear model here.
 	preset_qt = None
-	if args.sm_lin_model_type == 'global' and (args.sm_nepochs > 0):
+	if args.sm_lin_model_type == 'global' and (args.sm_nepochs > 0) and (not args.no_perturb):
 		best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
 		init_param_counts = np.zeros_like(best_fit)
 		start_idx = 0
@@ -323,8 +333,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			start_idx += num_entries
 		preset_qt = 0
 
+	
 	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt, no_regression=(args.sm_nepochs == 0))
-	time_delta = time() - start
 	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
 
@@ -489,6 +499,7 @@ def main():
 	parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
+	parser.add_argument('--no_perturb', action="store_true", help="We do not perform any perturbation")
 
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
@@ -527,7 +538,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
 
 	original_param_count = get_param_count(model)

@@ -112,8 +112,8 @@ def get_llm(model_name, cache_dir="llm_weights"):
 		device_map="auto"
 	)
 	model.seqlen = model.config.max_position_embeddings 
-	if ('13b' in model_name) or ('65b' in model_name):
-		model.seqlen = 2048 #Based on the values from the Lora-prune paper
+# 	if ('13b' in model_name) or ('65b' in model_name):
+# 		model.seqlen = 2048 #Based on the values from the Lora-prune paper
 	return model
 
 def hook_fn(module_name, info_cache):
@@ -538,7 +538,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
 
 	original_param_count = get_param_count(model)

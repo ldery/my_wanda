@@ -7,7 +7,7 @@ import pdb
 from .data import get_loaders 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl(model, tokenizer, device=torch.device("cuda:0"), dataset="wikitext2"):
+def eval_ppl(model, tokenizer, device=torch.device("cuda:0"), dataset="wikitext2", bsz=1):
 
 	# Print status
 	print(f"evaluating on {dataset}")
@@ -19,8 +19,8 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0"), dataset="wikitext2
 
 	# Evaluate ppl in no grad context to avoid updating the model
 	with torch.no_grad():
-		ppl_test = eval_ppl_test(model, testloader, 1, device)
-		ppl_train = eval_ppl_train(model, trainloader, 1, device)
+		ppl_test = eval_ppl_test(model, testloader, bsz, device)
+		ppl_train = eval_ppl_train(model, trainloader, bsz, device)
 	return ppl_train, ppl_test 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer

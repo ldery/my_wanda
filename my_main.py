@@ -76,7 +76,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 			print(e)
 			gc.collect()
 			torch.cuda.empty_cache()
-			this_bsz = 1
+			this_bsz = 2
 			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
 
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
@@ -248,6 +248,8 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 	info_cache, hook_handles = defaultdict(dict), []
 	for (name, module) in model.named_modules():
 		# For now, only focus on the MLPs
+		if  name.endswith('self_attn') and (args.mlp_attn_ratio == 0):
+			continue
 		if name.endswith('mlp') or name.endswith('self_attn'):
 			# This module has already been fully pruned.
 			if module.skip_computation:
@@ -472,7 +474,7 @@ def prune_model(args, model, mask_info, tokenizer):
 		mask_ = mask_info[name]
 		if name.endswith('mlp'):
 			prune_mlp(mask_, module)
-		elif name.endswith('self_attn'):
+		elif name.endswith('self_attn') and (args.mlp_attn_ratio != 0):
 			prune_attn(mask_, module)
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))

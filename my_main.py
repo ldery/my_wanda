@@ -103,7 +103,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 	return all_masks, all_perfs
 
-def get_llm(model_name, cache_dir="llm_weights"):
+def get_llm(model_name, cache_dir="llm_weights", repair_method='none'):
 	model = LlamaForCausalLM.from_pretrained(
 		model_name, 
 		torch_dtype=torch.float16, 
@@ -114,6 +114,15 @@ def get_llm(model_name, cache_dir="llm_weights"):
 	model.seqlen = model.config.max_position_embeddings 
 # 	if ('13b' in model_name) or ('65b' in model_name):
 # 		model.seqlen = 2048 #Based on the values from the Lora-prune paper
+
+	if 'bias' in repair_method:
+		for name, module in model.named_modules():
+			if name.endswith('self_attn'):
+				device = module.o_proj.weight.device
+				module.o_proj.bias = torch.nn.Parameter(torch.zeros(module.o_proj.weight.shape[0], device=device).half())
+			elif name.endswith('mlp'):
+				device = module.down_proj.weight.device
+				module.down_proj.bias = torch.nn.Parameter(torch.zeros(module.down_proj.weight.shape[0], device=device).half())
 	return model
 
 def hook_fn(module_name, info_cache):
@@ -386,7 +395,7 @@ def get_linearmodel_hpdict(args):
 def get_param_count(model, exclude=['embed', 'head']):
 	return sum([p.numel() for n, p in model.named_parameters() if not any(x in n for x in exclude)])
 
-def prune_mlp(mask_, module):
+def prune_mlp(mask_, module, use_avg=False):
 	# Reset pruning related information
 	module.main_mask = None
 	module.temp_mask = None
@@ -401,13 +410,33 @@ def prune_mlp(mask_, module):
 		module.intermediate_size = 0
 		module.skip_computation = True
 	else:
-		index = mask_.squeeze().nonzero().squeeze()
+		mask_ = mask_.squeeze()
+		if use_avg:
+			print('Doing avg in MLP')
+			index = (mask_ == 0).nonzero().squeeze()
+			with torch.no_grad():
+				avg = (module.gate_proj.weight[index]).mean(axis=0)
+				module.gate_proj.weight[index[0]] = avg
+
+				avg = (module.up_proj.weight[index]).mean(axis=0)
+				module.up_proj.weight[index[0]] = avg
+
+				avg = (module.down_proj.weight[:, index]).mean(axis=-1)
+				module.down_proj.weight[:, index[0]] = avg
+
+			mask_[index[0]] = 1
+
+		index = mask_.nonzero().squeeze()
 		new_gate_proj = (prune_linear_layer(module.gate_proj, index)).half()
 		module.gate_proj = None
 		module.gate_proj = new_gate_proj
+
+
 		new_up_proj = (prune_linear_layer(module.up_proj, index)).half()
 		module.up_proj  = None
 		module.up_proj = new_up_proj
+
+
 		new_down_proj = (prune_linear_layer(module.down_proj, index, dim=1)).half()
 		module.down_proj = None
 		module.down_proj = new_down_proj
@@ -416,7 +445,7 @@ def prune_mlp(mask_, module):
 	gc.collect()
 	torch.cuda.empty_cache()
 
-def prune_attn(mask_, module):
+def prune_attn(mask_, module, use_avg=False):
 
 	module.main_mask = None
 	module.temp_mask = None
@@ -434,7 +463,33 @@ def prune_attn(mask_, module):
 		module.hidden_size = 0
 		module.intermediate_size = 0
 	else:
-		index = (mask_.squeeze() == 0).nonzero().squeeze()
+		mask_ = mask_.squeeze()
+		if use_avg:
+			print('Doing avg in ATTN')
+			index = mask_.nonzero().squeeze()
+			if index.numel() == 1:
+				index = [index]
+
+			_, updated_indices = find_pruneable_heads_and_indices(
+				index, module.num_heads, module.head_dim, set()
+			)
+			with torch.no_grad():
+				index = (mask_ == 0).nonzero().squeeze()
+				avg = (module.q_proj.weight[updated_indices]).view(len(index), module.head_dim, -1).mean(axis=0)
+				module.q_proj.weight[(index[0]*module.head_dim):(index[0]+ 1)*module.head_dim, :] = avg
+
+				avg = (module.k_proj.weight[updated_indices]).view(len(index), module.head_dim, -1).mean(axis=0)
+				module.k_proj.weight[(index[0]*module.head_dim):(index[0]+ 1)*module.head_dim, :] = avg
+				
+				avg = (module.v_proj.weight[updated_indices]).view(len(index), module.head_dim, -1).mean(axis=0)
+				module.v_proj.weight[(index[0]*module.head_dim):(index[0]+ 1)*module.head_dim, :] = avg
+
+				avg = (module.o_proj.weight[:, updated_indices]).view(-1, len(index), module.head_dim).mean(axis=1)
+				module.o_proj.weight[:, (index[0]*module.head_dim):(index[0]+ 1)*module.head_dim] = avg
+
+			mask_[index[0]] = 1
+
+		index = (mask_ == 0).nonzero().squeeze()
 		if index.numel() == 1:
 			index = [index]
 
@@ -468,16 +523,40 @@ def prune_attn(mask_, module):
 
 
 def prune_model(args, model, mask_info, tokenizer):
+	if 'bias' in args.repair_method:
+		info_cache, hook_handles = defaultdict(dict), []
+		for (name, module) in model.named_modules():
+			if name not in mask_info: continue # We are not pruning this
+
+			mask_ = mask_info[name]
+			module.computing_updated_bias = 1 - mask_
+
+			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
+
+		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples, seed=0, dataset=args.dataset)
+
+		for handle in hook_handles:
+			handle.remove()
+
 	for (name, module) in model.named_modules():
 		if name not in mask_info: continue # We are not pruning this
 
 		mask_ = mask_info[name]
+		if 'bias' in args.repair_method:
+			print('Using Bias method')
+			new_param = torch.nn.Parameter((info_cache[name]['in'][1]/info_cache[name]['in'][0]).squeeze().half())
 		if name.endswith('mlp'):
-			prune_mlp(mask_, module)
+			prune_mlp(mask_, module, use_avg=("weight_average" in args.repair_method))
+			if 'bias' in args.repair_method:
+				module.down_proj.bias = new_param
 		elif name.endswith('self_attn') and (args.mlp_attn_ratio != 0):
-			prune_attn(mask_, module)
+			prune_attn(mask_, module, use_avg=("weight_average" in args.repair_method))
+			if 'bias' in args.repair_method:
+				module.o_proj.bias = new_param
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
+
+		module.computing_updated_bias = None
 
 	gc.collect()
 	torch.cuda.empty_cache() 
@@ -493,6 +572,7 @@ def main():
 	parser.add_argument('--prune_frac', type=float, default=0.1, help='Fraction of weights to prune at a time')
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
 	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
+	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias", "weight_average", "bias|weight_average",])
 
 	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
@@ -535,12 +615,12 @@ def main():
 
 	model_name = args.model.split("/")[-1]
 	print(f"loading llm model {args.model}")
-	model = get_llm(args.model, args.cache_dir)
+	model = get_llm(args.model, args.cache_dir, repair_method=args.repair_method)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-	
+
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
 
 	original_param_count = get_param_count(model)
@@ -572,9 +652,10 @@ def main():
 				pkl.dump(mask_info, handle)
 
 		print('Prune model')
-		prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
+		with torch.no_grad():
+			prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
-		print(model)
+# 		print(model)
 
 		# Evaluate the performance of the pruned model
 		start_time = time()

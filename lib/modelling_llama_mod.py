@@ -249,7 +249,7 @@ class LlamaAttention(nn.Module):
 		elif self.prune_method == "wanda":
 			with torch.no_grad():
 				ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
-				ins_ = self.o_proj.weight.data * (ins_.pow(2).mean(0, keepdim=True).sqrt()).to(torch.float16)
+				ins_ = self.o_proj.weight.data.abs() * (ins_.pow(2).mean(0, keepdim=True).sqrt()).to(torch.float16)
 				self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():

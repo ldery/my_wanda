@@ -179,6 +179,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 				xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
 		xs = [k.cuda() for k in xs]
 		ys = score_perfs[1][id_]
+ 
 		sm_hp_searcher = ScoreModelHP(
 				id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
 				base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
@@ -547,7 +548,7 @@ def main():
 	parser.add_argument('--prune_frac', type=float, default=0.1, help='Fraction of weights to prune at a time')
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
 	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
-	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias", "weight_average", "bias|weight_average",])
+	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias"])
 
 	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
@@ -583,11 +584,11 @@ def main():
 	torch.random.manual_seed(args.seed)
 
 	wandb_run = None
-# 	wandb_run = wandb.init(
-# 		project=args.wandb_project_name,
-# 		name=str_of_args,
-# 		config=args_to_dict(args),
-# 	)
+	wandb_run = wandb.init(
+		project=args.wandb_project_name,
+		name=str_of_args,
+		config=args_to_dict(args),
+	)
 
 	model_name = args.model.split("/")[-1]
 	print(f"loading llm model {args.model}")
@@ -597,7 +598,7 @@ def main():
 
 	start_time = time()
 	model.seqlen = model.config.max_position_embeddings 
-	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
 

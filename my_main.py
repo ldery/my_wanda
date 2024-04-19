@@ -65,11 +65,10 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
 				this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
 				continue_ = False
 			except Exception as e:
-				print(e)
+				print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
 				gc.collect()
 				torch.cuda.empty_cache()
 				this_bsz = max(1, this_bsz // 2)
-				this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
 
 	return this_ppl, this_bsz
 

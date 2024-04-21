@@ -126,14 +126,6 @@ def get_llm(model_name, cache_dir="llm_weights", repair_method='none', prune_seq
 		device_map="auto"
 	)
 	model.seqlen = prune_seqlen
-	if 'bias' in repair_method:
-		for name, module in model.named_modules():
-			if name.endswith('self_attn'):
-				device = module.o_proj.weight.device
-				module.o_proj.bias = torch.nn.Parameter(torch.zeros(module.o_proj.weight.shape[0], device=device).half())
-			elif name.endswith('mlp'):
-				device = module.down_proj.weight.device
-				module.down_proj.bias = torch.nn.Parameter(torch.zeros(module.down_proj.weight.shape[0], device=device).half())
 	return model
 
 def hook_fn(module_name, info_cache):
@@ -210,7 +202,7 @@ def run_data_to_sampling_proba(info, module, pfrac):
 	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
 	return sampling_proba, fixed_indices, use_indices
 
-def investigate_score_based_mask(args, model, wandb_run, global_calibration_data, epoch_=1):
+def investigate_score_based_mask(args, model, wandb_run, tokenizer, epoch_=1):
 
 	def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
 		score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
@@ -287,6 +279,9 @@ def investigate_score_based_mask(args, model, wandb_run, global_calibration_data
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	# warmup the cache for computing the prior probabilities
+	global_calibration_data, _ = get_loaders(
+			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+	)
 	get_train_ppl_multitry(model, global_calibration_data, args.bsz)
 
 	hp_dict = get_linearmodel_hpdict(args)
@@ -495,7 +490,7 @@ def prune_attn(mask_, module):
 	torch.cuda.empty_cache() 
 
 
-def prune_model(args, model, mask_info, tokenizer, global_calibration_data, epoch=1):
+def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info=None, epoch=1):
 	info_cache, hook_handles = defaultdict(dict), []
 	if 'bias' in args.repair_method:
 		for (name, module) in model.named_modules():
@@ -508,7 +503,7 @@ def prune_model(args, model, mask_info, tokenizer, global_calibration_data, epoc
 		gc.collect()
 		torch.cuda.empty_cache()
 
-		this_ppl, _ = get_train_ppl_multitry(model, global_calibration_data, args.bsz)
+		this_ppl, _ = get_train_ppl_multitry(model, bias_calibration_data, args.bsz)
 		for handle in hook_handles:
 			handle.remove()
 
@@ -517,15 +512,15 @@ def prune_model(args, model, mask_info, tokenizer, global_calibration_data, epoc
 
 		mask_ = mask_info[name]
 		if 'bias' in args.repair_method:
-			new_param = torch.nn.Parameter((info_cache[name]['in'][1]/(info_cache[name]['in'][0] * epoch)).squeeze().half())
+			new_param = (info_cache[name]['in'][1]/(info_cache[name]['in'][0] * epoch)).squeeze()
+			if bias_info[name] is not None:
+				bias_info[name].mul_((epoch - 1)/epoch).add_(new_param)
+			else:
+				bias_info[name] = new_param
 		if name.endswith('mlp'):
 			prune_mlp(mask_, module)
-			if 'bias' in args.repair_method:
-				module.down_proj.bias.mul_((epoch - 1)/epoch).add_(new_param)
 		elif name.endswith('self_attn') and (args.mlp_attn_ratio != 0):
 			prune_attn(mask_, module)
-			if 'bias' in args.repair_method:
-				module.o_proj.bias.mul_((epoch - 1)/epoch).add_(new_param)
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
 
@@ -533,7 +528,16 @@ def prune_model(args, model, mask_info, tokenizer, global_calibration_data, epoc
 		module.computing_updated_bias = None
 
 	gc.collect()
-	torch.cuda.empty_cache() 
+	torch.cuda.empty_cache()
+
+def post_pruning_bias_fix(model, bias_info):
+	for name, module in model.named_modules():
+		if name.endswith('self_attn'):
+			device = module.o_proj.weight.device
+			module.o_proj.bias = torch.nn.Parameter((bias_info[name]).half())
+		elif name.endswith('mlp'):
+			device = module.down_proj.weight.device
+			module.down_proj.bias = torch.nn.Parameter((bias_info[name]).half())
 
 
 def main():
@@ -597,24 +601,25 @@ def main():
 
 	start_time = time()
 	model.seqlen = model.config.max_position_embeddings 
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = -1,-1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
+
+	if args.repair_method == 'bias':
+		bias_info = defaultdict(lambda: None)
+		bias_calibration_data, _ = get_loaders(
+			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+		)
+
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
 	cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
 	epoch_ = 1
 
-	whole_program_start = time()
-	total_prune_time, total_perturb_time = 0, 0
 	while True:
 		if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
 			break
-
-		global_calibration_data, _ = get_loaders(
-			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
-		)
 
 		# Need to check if we have to clip the sparsity ratio
 		if (cur_sparsity + args.prune_frac) > args.sparsity_ratio:
@@ -631,9 +636,7 @@ def main():
 			with open(save_loc, 'rb') as handle:
 				mask_info = pkl.load(handle)
 		else:
-			perturb_start = time()
-			mask_info = investigate_score_based_mask(args, model, wandb_run, global_calibration_data, epoch_=epoch_)
-			total_perturb_time += time() - perturb_start
+			mask_info = investigate_score_based_mask(args, model, wandb_run, tokenizer, epoch_=epoch_)
 
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
@@ -641,36 +644,30 @@ def main():
 
 		print('Prune model')
 		with torch.no_grad():
-			prune_start = time()
-			prune_model(args, model, mask_info, tokenizer, global_calibration_data, epoch=epoch_) # Do some stuffs here :)
-			total_prune_time += time() - prune_start
+			prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info, epoch=epoch_) # Do some stuffs here :)
 
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
 
 		# Evaluate the performance of the pruned model
-		start_time = time()
 		model.seqlen = model.config.max_position_embeddings 
 		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 		model.seqlen = args.prune_seqlen
 
-		pruned_model_runtime = time() - start_time
-
 		if wandb_run is not None:
-			wandb_run.log({
-				'Relative-Speedup': original_runtime / pruned_model_runtime,
-			})
-
 			wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
 		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
 
 		epoch_ += 1
+	
+	if args.repair_method == 'bias':
+		post_pruning_bias_fix(model, bias_info)
+		# Evaluate the performance of the pruned model
+		model.seqlen = model.config.max_position_embeddings 
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		model.seqlen = args.prune_seqlen
+		wandb_run.log({'Post-Bias-TrainPPL': ppl_train, 'Post-Bias-TestPPL': ppl_test})
+		print('[Post-Bias] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
 
-	whole_program_end = time()
-	print('The program took : {:.3f} min. Avg Perturb Time = {:.3f} | Avg Prune Time = {:3f}'.format(
-		(whole_program_end - whole_program_start)/60, 
-		(total_perturb_time / (epoch_ * 60)), 
-		(total_prune_time / (epoch_ * 60))
-	))
 
 	if wandb_run is not None:
 		wandb_run.log({'sparsity': cur_sparsity})

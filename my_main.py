@@ -19,8 +19,6 @@ import wandb
 from transformers.pytorch_utils import  find_pruneable_heads_and_indices, prune_linear_layer
 import gc
 import random
-from cProfile import Profile
-from pstats import SortKey, Stats
 
 
 print('torch', version('torch'))
@@ -78,15 +76,12 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 	for k, (name, module) in module_map.items():
 		module.is_using_main = False
 
-	#need to do something here
-	niters = mpi // 2
-	total_samples = nsamples * niters
-	trainloader, _ = get_loaders(
-		dataset_, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+	this_train_samples, _ = get_loaders(
+		dataset_, nsamples=nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 	)
 
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
-	for iter_ in range(niters):
+	for iter_ in range(mpi // 2):
 		this_bsz = bsz
 		this_train_samples = trainloader[(iter_ * nsamples):(iter_ + 1)*nsamples]
 
@@ -150,7 +145,6 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 			base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
 			base_mask = (base_mask.squeeze() * module.main_mask.squeeze().float())[use_indices]
 			base_mask = (base_mask / base_mask.sum()).view(-1, 1)
-
 			sm_hp_searcher = ScoreModelHP(
 				id_='{}/{}'.format(parent_id, id_), num_players=score_perfs[0][id_][0].numel(),
 				base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
@@ -346,7 +340,6 @@ def investigate_score_based_mask(args, model, wandb_run, tokenizer, epoch_=1):
 			start_idx += num_entries
 		preset_qt = 0
 
-	
 	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt, no_regression=(args.sm_nepochs == 0))
 	if wandb_run is not None:
 		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
@@ -600,7 +593,7 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	start_time = time()
-	model.seqlen = model.config.max_position_embeddings 
+	model.seqlen = model.config.max_position_embeddings
 	_, orig_test_ppl = -1,-1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
@@ -610,7 +603,6 @@ def main():
 		bias_calibration_data, _ = get_loaders(
 			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 		)
-
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
@@ -675,10 +667,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-# 			with Profile() as profile:
-# 				mask_info = investigate_score_based_mask(args, model, wandb_run, epoch_=epoch_)
-# 				this_stats = Stats(profile).strip_dirs()
-
-# 			print(this_stats.sort_stats(SortKey.CUMULATIVE).print_stats(10))

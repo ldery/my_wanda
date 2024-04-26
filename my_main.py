@@ -10,6 +10,7 @@ import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
 from lib.modelling_llama_mod import LlamaForCausalLM
+from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly
 from collections import defaultdict
@@ -564,6 +565,7 @@ def main():
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	parser.add_argument('--last-epoch', type=int, default=15)
+	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias"])
 
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
@@ -592,8 +594,14 @@ def main():
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 	
 	start_time = time()
-	_, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
+	
+	if args.repair_method == 'bias':
+		bias_info = defaultdict(lambda: None)
+		bias_calibration_data, _ = get_loaders(
+			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+		)
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
@@ -624,7 +632,7 @@ def main():
 				pkl.dump(mask_info, handle)
 
 		print('Prune model')
-		prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
+		prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info, epoch=epoch_)
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
 		print(model)
 

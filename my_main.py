@@ -467,11 +467,48 @@ def prune_attn(mask_, module):
 	torch.cuda.empty_cache() 
 
 
-def prune_model(args, model, mask_info, tokenizer):
+# def prune_model(args, model, mask_info, tokenizer):
+# 	for (name, module) in model.named_modules():
+# 		if name not in mask_info: continue # We are not pruning this
+
+# 		mask_ = mask_info[name]
+# 		if name.endswith('mlp'):
+# 			prune_mlp(mask_, module)
+# 		elif name.endswith('self_attn') and (args.mlp_attn_ratio != 0):
+# 			prune_attn(mask_, module)
+# 		else:
+# 			raise ValueError("Invalid type found in mask_info : {}".format(name))
+
+# 	gc.collect()
+# 	torch.cuda.empty_cache()
+
+def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info=None, epoch=1):
+	info_cache, hook_handles = defaultdict(dict), []
+	if 'bias' in args.repair_method:
+		for (name, module) in model.named_modules():
+			if name not in mask_info: continue # We are not pruning this
+
+			module.computing_updated_bias = 1 - mask_info[name]
+			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
+
+		# do garbage collection here
+		gc.collect()
+		torch.cuda.empty_cache()
+
+		this_ppl, _ = get_train_ppl_multitry(model, bias_calibration_data, args.bsz)
+		for handle in hook_handles:
+			handle.remove()
+
 	for (name, module) in model.named_modules():
 		if name not in mask_info: continue # We are not pruning this
 
 		mask_ = mask_info[name]
+		if 'bias' in args.repair_method:
+			new_param = (info_cache[name]['in'][1]/(info_cache[name]['in'][0] * epoch)).squeeze()
+			if bias_info[name] is not None:
+				bias_info[name].mul_((epoch - 1)/epoch).add_(new_param)
+			else:
+				bias_info[name] = new_param
 		if name.endswith('mlp'):
 			prune_mlp(mask_, module)
 		elif name.endswith('self_attn') and (args.mlp_attn_ratio != 0):
@@ -479,8 +516,22 @@ def prune_model(args, model, mask_info, tokenizer):
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
 
+		del new_param
+		module.computing_updated_bias = None
+
 	gc.collect()
-	torch.cuda.empty_cache() 
+	torch.cuda.empty_cache()
+
+
+
+def post_pruning_bias_fix(model, bias_info):
+	for name, module in model.named_modules():
+		if name.endswith('self_attn'):
+			device = module.o_proj.weight.device
+			module.o_proj.bias = torch.nn.Parameter((bias_info[name]).half())
+		elif name.endswith('mlp'):
+			device = module.down_proj.weight.device
+			module.down_proj.bias = torch.nn.Parameter((bias_info[name]).half())
 
 
 def main():
@@ -512,7 +563,8 @@ def main():
 
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
-	
+	parser.add_argument('--last-epoch', type=int, default=15)
+
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
 
@@ -589,7 +641,10 @@ def main():
 		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
 
 		epoch_ += 1
+		if epoch_ == args.last_epoch:
+			break
 
+	post_pruning_bias_fix(model, bias_info)
 	wandb_run.log({'sparsity': cur_sparsity})
 
 

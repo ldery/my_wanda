@@ -83,7 +83,6 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
 	for iter_ in range(mpi // 2):
 		this_bsz = bsz
-		this_train_samples = trainloader[(iter_ * nsamples):(iter_ + 1)*nsamples]
 
 		# set the layer mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
@@ -288,6 +287,7 @@ def investigate_score_based_mask(args, model, wandb_run, tokenizer, epoch_=1):
 		this_pfrac = None if args.no_perturb else this_pfrac
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
+
 
 	if not args.no_perturb: # We are not running a perturbation algorithm
 		# Clear the info-cache for the next round !
@@ -592,11 +592,9 @@ def main():
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
-	start_time = time()
 	model.seqlen = model.config.max_position_embeddings
-	_, orig_test_ppl = -1,-1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	_, orig_test_ppl, original_runtime = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	model.seqlen = args.prune_seqlen
-	original_runtime = time() - start_time
 
 	if args.repair_method == 'bias':
 		bias_info = defaultdict(lambda: None)
@@ -642,12 +640,13 @@ def main():
 
 		# Evaluate the performance of the pruned model
 		model.seqlen = model.config.max_position_embeddings 
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		ppl_train, ppl_test, this_runtime = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 		model.seqlen = args.prune_seqlen
 
+		print('This is the og_runtime : ', original_runtime, ' and the new runtime : ', this_runtime)
 		if wandb_run is not None:
 			wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
-		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
+		print('Sparsity = {:.3f} | Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
 
 		epoch_ += 1
 	
@@ -655,10 +654,11 @@ def main():
 		post_pruning_bias_fix(model, bias_info)
 		# Evaluate the performance of the pruned model
 		model.seqlen = model.config.max_position_embeddings 
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		ppl_train, ppl_test, new_runtime = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 		model.seqlen = args.prune_seqlen
-		wandb_run.log({'Post-Bias-TrainPPL': ppl_train, 'Post-Bias-TestPPL': ppl_test})
-		print('[Post-Bias] Train PPL = {:.3f} | Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+		this_speedup = (original_runtime / new_runtime)
+		wandb_run.log({'Post-Bias-TrainPPL': ppl_train, 'Post-Bias-TestPPL': ppl_test, 'Relative-Speedup': this_speedup})
+		print('[Post-Bias] Train PPL = {:.3f} | Test PPL = {:.3f} | Speedup = {:.3f}x'.format(ppl_train, ppl_test, this_speedup))
 
 
 	if wandb_run is not None:

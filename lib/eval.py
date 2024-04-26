@@ -1,5 +1,5 @@
 # Import necessary modules
-import time
+from time import time
 import torch
 import torch.nn as nn
 import pdb
@@ -19,9 +19,9 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0"), dataset="wikitext2
 
 	# Evaluate ppl in no grad context to avoid updating the model
 	with torch.no_grad():
-		ppl_test = eval_ppl_test(model, testloader, bsz, device)
+		ppl_test, test_time = eval_ppl_test(model, testloader, bsz, device)
 		ppl_train = eval_ppl_train(model, trainloader, bsz, device)
-	return ppl_train, ppl_test 
+	return ppl_train, ppl_test, test_time
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
 def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0"), seed=0, dataset="wikitext2"):
@@ -103,6 +103,7 @@ def eval_ppl_test(model, testenc, bs=1, device=None):
 	print(f"nsamples {nsamples}")
 
 	# Loop through each batch
+	total_time, total_iters = 0, 0
 	for i in range(0,nsamples,bs):
 		if i % 50 == 0:
 			print(f"sample {i}")
@@ -115,7 +116,13 @@ def eval_ppl_test(model, testenc, bs=1, device=None):
 		inputs = inputs.reshape(j-i, model.seqlen)
 
 		# Forward pass through the model
-		lm_logits = model(inputs).logits
+		with torch.no_grad():
+			start_ = time()
+			model_out = model(inputs)
+			total_time += (time() - start_)
+		total_iters += 1
+
+		lm_logits = model_out.logits
 
 		# Shift logits and labels for next token prediction
 		shift_logits = lm_logits[:, :-1, :].contiguous()
@@ -137,4 +144,4 @@ def eval_ppl_test(model, testenc, bs=1, device=None):
 	# Empty CUDA cache to save memory
 	torch.cuda.empty_cache()
 
-	return ppl.item()
+	return ppl.item(), total_time / total_iters

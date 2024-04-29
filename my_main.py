@@ -56,7 +56,22 @@ def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
 	init_set[:, :, chosen_idxs] = 0
 	return init_set
 
-def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0, dataset_="wikitext2"):
+def get_train_ppl_multitry(model, trainloader, this_bsz):
+	continue_ = True
+	while continue_:
+		with torch.no_grad():
+			try:
+				this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+				continue_ = False
+			except Exception as e:
+				print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
+				gc.collect()
+				torch.cuda.empty_cache()
+				this_bsz = max(1, this_bsz // 2)
+
+	return this_ppl, this_bsz
+
+def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
 
 	# set to use main
 	for k, (name, module) in module_map.items():
@@ -69,16 +84,7 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 
 		# set the layer mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
-
-		# TODO (clean up with a wrapper since this is repeated code)
-		try:
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
-		except Exception as e:
-			print(e)
-			gc.collect()
-			torch.cuda.empty_cache()
-			this_bsz = 2
-			this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
+		this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
 
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
@@ -88,8 +94,11 @@ def get_random_mask_scores(model, tokenizer, module_map, all_sampling_proba, bsz
 			all_perfs[k].append(-this_ppl)
 
 		# set the complement mask here
-		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio, use_complement=True)
-		this_ppl = eval_ppl_trainonly(model, tokenizer, bsz=this_bsz, nsamples=nsamples, seed=seed_, dataset=dataset_)
+		set_masks(
+			module_map, all_masks, all_sampling_proba, pfrac=pfrac,
+			mlp_attn_ratio=mlp_attn_ratio, use_complement=True
+		)
+		this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
 
 		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
@@ -190,7 +199,7 @@ def run_data_to_sampling_proba(info, module, pfrac):
 	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
 	return sampling_proba, fixed_indices, use_indices
 
-def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
+def investigate_score_based_mask(args, model, wandb_run, dataset, tokenizer, epoch_=1):
 
 	def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
 		score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
@@ -264,15 +273,7 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 			module.prune_method = args.prune_method
 
 	# Initial setup to get the initial probability distribution for sampling
-	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-
-	try:
-		eval_ppl_trainonly(model, tokenizer, bsz=args.bsz, nsamples=args.nsamples, dataset=args.dataset)
-	except Exception as e:
-		print(e)
-		gc.collect()
-		torch.cuda.empty_cache()
-		eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=args.nsamples, dataset=args.dataset)
+	get_train_ppl_multitry(model, dataset, args.bsz)
 
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
@@ -292,10 +293,9 @@ def investigate_score_based_mask(args, model, wandb_run, epoch_=1):
 
 		start = time()
 		score_info = get_random_mask_scores(
-							model, tokenizer, module_map, all_sampling_proba,
+							model, dataset, module_map, all_sampling_proba,
 							bsz=args.bsz, nsamples=args.nsamples,
-							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio,
-							dataset_=args.dataset
+							mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
 		)
 		gen_scores_time = time() - start
 		start = time()
@@ -465,38 +465,7 @@ def prune_attn(mask_, module):
 
 
 	gc.collect()
-	torch.cuda.empty_cache() 
-
-
-# def prune_model(args, model, mask_info, tokenizer):
-# 	for (name, module) in model.named_modules():
-# 		if name not in mask_info: continue # We are not pruning this
-
-# 		mask_ = mask_info[name]
-# 		if name.endswith('mlp'):
-# 			prune_mlp(mask_, module)
-# 		elif name.endswith('self_attn') and (args.mlp_attn_ratio != 0):
-# 			prune_attn(mask_, module)
-# 		else:
-# 			raise ValueError("Invalid type found in mask_info : {}".format(name))
-
-# 	gc.collect()
-# 	torch.cuda.empty_cache()
-
-def get_train_ppl_multitry(model, trainloader, this_bsz):
-	continue_ = True
-	while continue_:
-		with torch.no_grad():
-			try:
-				this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
-				continue_ = False
-			except Exception as e:
-				print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
-				gc.collect()
-				torch.cuda.empty_cache()
-				this_bsz = max(1, this_bsz // 2)
-
-	return this_ppl, this_bsz
+	torch.cuda.empty_cache()
 
 def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info=None, epoch=1):
 	info_cache, hook_handles = defaultdict(dict), []
@@ -579,7 +548,7 @@ def main():
 
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
-	parser.add_argument('--last-epoch', type=int, default=15)
+	parser.add_argument('--last-epoch', type=int, default=-1)
 	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias"])
 
 	# Wandb HP
@@ -607,16 +576,26 @@ def main():
 	model = get_llm(args.model, args.cache_dir)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-	
+
 	start_time = time()
-	_, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
 	original_runtime = time() - start_time
-	
+	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))
+
 	if args.repair_method == 'bias':
 		bias_info = defaultdict(lambda: None)
 		bias_calibration_data, _ = get_loaders(
 			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 		)
+
+	# Get the full dataset that we are going to be passing around!
+	total_samples = args.nsamples * (int((args.sparsity_ratio / args.prune_frac)) + 4) # + 4 is a buffer in case the pruning ends up needing more steps
+	full_dataset, _ = get_loaders(
+			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+	)
+	full_dataset, _ = get_loaders(
+			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+	)
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
@@ -641,7 +620,8 @@ def main():
 			with open(save_loc, 'rb') as handle:
 				mask_info = pkl.load(handle)
 		else:
-			mask_info = investigate_score_based_mask(args, model, wandb_run, epoch_=epoch_)
+			this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
+			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, tokenizer, epoch_=epoch_)
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
 				pkl.dump(mask_info, handle)
@@ -667,11 +647,12 @@ def main():
 		if epoch_ == args.last_epoch:
 			break
 
-	post_pruning_bias_fix(model, bias_info)
-	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
-	wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
-	print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
-	wandb_run.log({'sparsity': cur_sparsity})
+	if args.repair_method == 'bias':
+		post_pruning_bias_fix(model, bias_info)
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
+		print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+		wandb_run.log({'sparsity': cur_sparsity})
 
 
 if __name__ == '__main__':

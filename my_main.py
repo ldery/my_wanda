@@ -12,7 +12,7 @@ from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablat
 from lib.modelling_llama_mod import LlamaForCausalLM
 from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
-from lib.eval import eval_ppl, eval_ppl_trainonly
+from lib.eval import eval_ppl, eval_ppl_trainonly, eval_ppl_train
 from collections import defaultdict
 import pickle as pkl
 import random
@@ -483,6 +483,21 @@ def prune_attn(mask_, module):
 # 	gc.collect()
 # 	torch.cuda.empty_cache()
 
+def get_train_ppl_multitry(model, trainloader, this_bsz):
+	continue_ = True
+	while continue_:
+		with torch.no_grad():
+			try:
+				this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+				continue_ = False
+			except Exception as e:
+				print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
+				gc.collect()
+				torch.cuda.empty_cache()
+				this_bsz = max(1, this_bsz // 2)
+
+	return this_ppl, this_bsz
+
 def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info=None, epoch=1):
 	info_cache, hook_handles = defaultdict(dict), []
 	if 'bias' in args.repair_method:
@@ -653,6 +668,9 @@ def main():
 			break
 
 	post_pruning_bias_fix(model, bias_info)
+	ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
+	print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
 	wandb_run.log({'sparsity': cur_sparsity})
 
 

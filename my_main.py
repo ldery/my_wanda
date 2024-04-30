@@ -121,6 +121,9 @@ def get_llm(model_name, cache_dir="llm_weights"):
 		low_cpu_mem_usage=True, 
 		device_map="auto"
 	)
+	print('xx'*20)
+	print('This is the current model sequence length: ', model.config.max_position_embeddings )
+	print('xx'*20)
 	model.seqlen = model.config.max_position_embeddings 
 # 	if ('13b' in model_name) or ('65b' in model_name):
 # 		model.seqlen = 2048 #Based on the values from the Lora-prune paper
@@ -199,7 +202,7 @@ def run_data_to_sampling_proba(info, module, pfrac):
 	assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
 	return sampling_proba, fixed_indices, use_indices
 
-def investigate_score_based_mask(args, model, wandb_run, dataset, tokenizer, epoch_=1):
+def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior, tokenizer, epoch_=1):
 
 	def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
 		score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
@@ -273,7 +276,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, tokenizer, epo
 			module.prune_method = args.prune_method
 
 	# Initial setup to get the initial probability distribution for sampling
-	get_train_ppl_multitry(model, dataset, args.bsz)
+	get_train_ppl_multitry(model, data_for_prior, args.bsz)
 
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
@@ -593,7 +596,7 @@ def main():
 	full_dataset, _ = get_loaders(
 			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 	)
-	full_dataset, _ = get_loaders(
+	prior_dataset, _ = get_loaders(
 			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 	)
 
@@ -621,7 +624,8 @@ def main():
 				mask_info = pkl.load(handle)
 		else:
 			this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
-			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, tokenizer, epoch_=epoch_)
+			this_prior = prior_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
+			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, this_prior, tokenizer, epoch_=epoch_)
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
 				pkl.dump(mask_info, handle)

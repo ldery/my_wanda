@@ -374,13 +374,14 @@ def args_to_dict(args):
 		'Lin.regtype': args.sm_reg_type, 
 		'pmethod': args.prune_method,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'Lin.regweight': stringify(args.sm_reg_weight),
+		'Lin.regw': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
 		'Lin.bsz': stringify(args.sm_bsz),
-		'Lin.nepochs': args.sm_nepochs,
+		'Lin.neps': args.sm_nepochs,
 		'Lin.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name,
-		'Adaptive': 'Yes'
+		'Adapt': 'Yes',
+		'Prior.FixData': 'Yes',
 	}
 
 def args_to_str(args):
@@ -564,7 +565,7 @@ def main():
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	parser.add_argument('--last-epoch', type=int, default=-1)
-	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias"])
+	parser.add_argument('--repair_method', type=str, default='bias', choices=["none", "bias"])
 
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
@@ -597,6 +598,7 @@ def main():
 	original_runtime = time() - start_time
 	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))
 
+	bias_info, bias_calibration_data = None, None
 	if args.repair_method == 'bias':
 		bias_info = defaultdict(lambda: None)
 		bias_calibration_data, _ = get_loaders(

@@ -170,7 +170,6 @@ class LlamaAttention(nn.Module):
 		self.prune_method = None
 		self.intermediate_size = self.num_heads
 		self.skip_computation = False
-		self.ins_ = None
 		self.computing_updated_bias = None
 
 

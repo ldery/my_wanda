@@ -10,6 +10,7 @@ import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
 from lib.modelling_llama_mod import LlamaForCausalLM
+from lib.modelling_olmo_mod import OlmoForCausalLM
 from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly, eval_ppl_train
@@ -114,19 +115,29 @@ def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=1
 	return all_masks, all_perfs
 
 def get_llm(model_name, cache_dir="llm_weights"):
-	model = LlamaForCausalLM.from_pretrained(
-		model_name, 
-		torch_dtype=torch.float16, 
-		cache_dir=cache_dir, 
-		low_cpu_mem_usage=True, 
-		device_map="auto"
-	)
-	print('xx'*20)
+
+	if 'llama' in model_name.lower():
+		model = LlamaForCausalLM.from_pretrained(
+			model_name,
+			torch_dtype=torch.float16,
+			cache_dir=cache_dir,
+			low_cpu_mem_usage=True,
+			device_map="auto"
+		)
+	elif 'olmo' in model_name.lower():
+		model = OlmoForCausalLM.from_pretrained(
+			model_name,
+			torch_dtype=torch.float16,
+			cache_dir=cache_dir,
+			low_cpu_mem_usage=True,
+			device_map="auto"
+		)
+
+	print('--'*50)
 	print('This is the current model sequence length: ', model.config.max_position_embeddings )
-	print('xx'*20)
+	print('--'*50)
 	model.seqlen = model.config.max_position_embeddings 
-# 	if ('13b' in model_name) or ('65b' in model_name):
-# 		model.seqlen = 2048 #Based on the values from the Lora-prune paper
+
 	return model
 
 def hook_fn(module_name, info_cache):
@@ -463,6 +474,7 @@ def prune_attn(mask_, module):
 		module.o_proj = new_o_proj
 
 		module.num_heads = len(mask_.squeeze().nonzero())
+		module.num_key_value_heads = module.num_heads
 		module.hidden_size = module.num_heads * module.head_dim
 		module.intermediate_size = module.num_heads
 
@@ -578,7 +590,7 @@ def main():
 	print(f"loading llm model {args.model}")
 	model = get_llm(args.model, args.cache_dir)
 	model.eval()
-	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=('olmo' in args.model.lower()))
 
 	start_time = time()
 	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
@@ -597,7 +609,7 @@ def main():
 			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 	)
 	prior_dataset, _ = get_loaders(
-			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+			args.dataset, nsamples=args.nsamples, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
 	)
 
 	original_param_count = get_param_count(model)
@@ -624,8 +636,7 @@ def main():
 				mask_info = pkl.load(handle)
 		else:
 			this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
-			this_prior = prior_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
-			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, this_prior, tokenizer, epoch_=epoch_)
+			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, prior_dataset, tokenizer, epoch_=epoch_)
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
 				pkl.dump(mask_info, handle)

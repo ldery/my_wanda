@@ -660,6 +660,12 @@ def main():
 		wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
 		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
 
+# 		if args.repair_method == 'bias':
+# 			post_pruning_bias_fix(model, bias_info)
+# 			ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+# 			wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
+# 			print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
+
 		epoch_ += 1
 		if epoch_ == args.last_epoch:
 			break

@@ -123,7 +123,7 @@ def get_llm(model_name, cache_dir="llm_weights", prune_seqlen=1024):
 	)
 	model.seqlen = prune_seqlen
 	print('xx'*20)
-	print('This is the current model sequence length: ', model.config.max_position_embeddings )
+	print('This is the current model sequence length: ', model.seqlen)
 	print('xx'*20)
 	return model
 
@@ -539,7 +539,7 @@ def main():
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
 	parser.add_argument('--no_perturb', action="store_true", help="We do not perform any perturbation")
-	parser.add_argument('--prune_seqlen', type=int, default=1024, help='the sequence length to use for pruning')
+	parser.add_argument('--prune_seqlen', type=int, default=-1, help='the sequence length to use for pruning')
 
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
@@ -576,16 +576,20 @@ def main():
 	model_name = args.model.split("/")[-1]
 	print(f"loading llm model {args.model}")
 	model = get_llm(args.model, args.cache_dir, args.prune_seqlen)
+	if args.prune_seqlen < 0:
+		args.prune_seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	start_time = time()
 	model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
 	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))
+	print('The model seqlen is set to ',model.seqlen)
 
+	bias_info, bias_calibration_data = None, None
 	if args.repair_method == 'bias':
 		bias_info = defaultdict(lambda: None)
 		bias_calibration_data, _ = get_loaders(
@@ -639,7 +643,7 @@ def main():
 		# Evaluate the performance of the pruned model
 		start_time = time()
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
 		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		pruned_model_runtime = time() - start_time
 
@@ -657,7 +661,7 @@ def main():
 	if args.repair_method == 'bias':
 		post_pruning_bias_fix(model, bias_info)
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
 		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
 		print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))

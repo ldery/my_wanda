@@ -113,7 +113,7 @@ def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=1
 
 	return all_masks, all_perfs
 
-def get_llm(model_name, cache_dir="llm_weights"):
+def get_llm(model_name, cache_dir="llm_weights", prune_seqlen=1024):
 	model = LlamaForCausalLM.from_pretrained(
 		model_name, 
 		torch_dtype=torch.float16, 
@@ -121,12 +121,10 @@ def get_llm(model_name, cache_dir="llm_weights"):
 		low_cpu_mem_usage=True, 
 		device_map="auto"
 	)
+	model.seqlen = prune_seqlen
 	print('xx'*20)
 	print('This is the current model sequence length: ', model.config.max_position_embeddings )
 	print('xx'*20)
-	model.seqlen = model.config.max_position_embeddings 
-# 	if ('13b' in model_name) or ('65b' in model_name):
-# 		model.seqlen = 2048 #Based on the values from the Lora-prune paper
 	return model
 
 def hook_fn(module_name, info_cache):
@@ -363,13 +361,13 @@ def args_to_dict(args):
 		'Lin.regtype': args.sm_reg_type, 
 		'pmethod': args.prune_method,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'Lin.regweight': stringify(args.sm_reg_weight),
+		'Lin.regW': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
 		'Lin.bsz': stringify(args.sm_bsz),
 		'Lin.nepochs': args.sm_nepochs,
 		'Lin.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name,
-		'Adaptive': 'Yes'
+		'P-Seqlen': args.prune_seqlen,
 	}
 
 def args_to_str(args):
@@ -541,6 +539,7 @@ def main():
 	parser.add_argument('--masks_per_iter', type=int, default=10, help='How many masks to generate per-iteration')
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
 	parser.add_argument('--no_perturb', action="store_true", help="We do not perform any perturbation")
+	parser.add_argument('--prune_seqlen', type=int, default=1024, help='the sequence length to use for pruning')
 
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
@@ -576,12 +575,14 @@ def main():
 
 	model_name = args.model.split("/")[-1]
 	print(f"loading llm model {args.model}")
-	model = get_llm(args.model, args.cache_dir)
+	model = get_llm(args.model, args.cache_dir, args.prune_seqlen)
 	model.eval()
 	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
 	start_time = time()
+	model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
 	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))
 
@@ -637,7 +638,9 @@ def main():
 
 		# Evaluate the performance of the pruned model
 		start_time = time()
+		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		pruned_model_runtime = time() - start_time
 
 		wandb_run.log({
@@ -653,7 +656,9 @@ def main():
 
 	if args.repair_method == 'bias':
 		post_pruning_bias_fix(model, bias_info)
+		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset)
+		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
 		print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
 		wandb_run.log({'sparsity': cur_sparsity})

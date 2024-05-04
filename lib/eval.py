@@ -3,6 +3,7 @@ import time
 import torch
 import torch.nn as nn
 import pdb
+import gc
 # Import get_loaders function from data module within the same directory
 from .data import get_loaders 
 
@@ -55,6 +56,7 @@ def eval_ppl_train(model, trainloader, bs=1, device=None):
 		if i % 50 == 0:
 			print(f"sample {i}")
 
+
 		# Calculate end index
 		j = min(i+bs, nsamples)
 
@@ -81,6 +83,9 @@ def eval_ppl_train(model, trainloader, bs=1, device=None):
 
 		# Append to list of negative log likelihoods
 		nlls.append(neg_log_likelihood)
+
+		gc.collect()
+		torch.cuda.empty_cache()
 
 	# Compute perplexity
 	ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
@@ -130,6 +135,9 @@ def eval_ppl_test(model, testenc, bs=1, device=None):
 
 		# Append to list of negative log likelihoods
 		nlls.append(neg_log_likelihood)
+
+		gc.collect()
+		torch.cuda.empty_cache()
 
 	# Compute perplexity
 	ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))

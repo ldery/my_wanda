@@ -182,6 +182,18 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 				xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
 		xs = [k.cuda() for k in xs]
 		ys = score_perfs[1][id_]
+
+		is_valid = np.array(ys) < INF
+		this_masks, this_scores = [], []
+		for idx, truth_val in enumerate(is_valid):
+			if truth_val:
+				this_masks.append(xs[idx])
+				this_scores.append(-np.log(-ys[idx]))
+		xs, ys = this_masks, this_scores
+		print('Total runs = {}, Total dropped = {}'.format(len(is_valid), len(is_valid) - sum(is_valid)))
+# 		print(ys)
+# 		pdb.set_trace()
+
 		sm_hp_searcher = ScoreModelHP(
 				id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
 				base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
@@ -597,7 +609,7 @@ def main():
 
 	start_time = time()
 	model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
+	orig_train_ppl, orig_test_ppl = -1, -1 #eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
 	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))

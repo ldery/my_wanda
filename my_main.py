@@ -381,11 +381,9 @@ def args_to_dict(args):
 		'sp': args.sparsity_ratio,
 		'pfrac': args.prune_frac,
 		'bsz': args.bsz,
-		'ma_ratio': args.mlp_attn_ratio,
 		'mpi': args.masks_per_iter,
 		'Lin.regtype': args.sm_reg_type, 
 		'pmethod': args.prune_method,
-		'mlp_attn_ratio': args.mlp_attn_ratio,
 		'Lin.regW': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
 		'Lin.bsz': stringify(args.sm_bsz),
@@ -393,6 +391,8 @@ def args_to_dict(args):
 		'Lin.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name,
 		'P-Seqlen': args.prune_seqlen,
+		'Inline-bias': args.inline_repair,
+		'bias_ns': args.bias_ns
 	}
 
 def args_to_str(args):
@@ -566,6 +566,7 @@ def main():
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
 	parser.add_argument('--no_perturb', action="store_true", help="We do not perform any perturbation")
 	parser.add_argument('--prune_seqlen', type=int, default=-1, help='the sequence length to use for pruning')
+	parser.add_argument('--bias_ns', type=int, default=256, help='Number of samples to use when estimating bias')
 
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
@@ -578,6 +579,7 @@ def main():
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	parser.add_argument('--last-epoch', type=int, default=-1)
 	parser.add_argument('--repair_method', type=str, default='bias', choices=["none", "bias"])
+	parser.add_argument('--inline-repair', action='store_true', help="Whether or not to do repair inline.")
 
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
@@ -619,7 +621,7 @@ def main():
 	if args.repair_method == 'bias':
 		bias_info = defaultdict(lambda: None)
 		bias_calibration_data, _ = get_loaders(
-			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+			args.dataset, nsamples=args.bias_ns, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 		)
 
 	# Get the full dataset that we are going to be passing around!
@@ -667,6 +669,10 @@ def main():
 		print(model)
 
 		# Evaluate the performance of the pruned model
+		if args.repair_method == 'bias' and args.inline_repair:
+			print('We are doing an inline repair of bias')
+			post_pruning_bias_fix(model, bias_info)
+
 		start_time = time()
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
@@ -684,7 +690,7 @@ def main():
 		if epoch_ == args.last_epoch:
 			break
 
-	if args.repair_method == 'bias':
+	if args.repair_method == 'bias' and not args.inline_repair:
 		post_pruning_bias_fix(model, bias_info)
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)

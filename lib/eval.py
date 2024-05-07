@@ -8,15 +8,7 @@ import gc
 from .data import get_loaders 
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl(model, tokenizer, device=torch.device("cuda:0"), dataset="wikitext2", bsz=1):
-
-	# Print status
-	print(f"evaluating on {dataset}")
-
-	# Get the test loader
-	trainloader, testloader = get_loaders(
-		dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
-	)
+def eval_ppl(model, trainloader, testloader, device=torch.device("cuda:0"), bsz=1):
 
 	# Evaluate ppl in no grad context to avoid updating the model
 	with torch.no_grad():
@@ -84,7 +76,6 @@ def eval_ppl_train(model, trainloader, bs=1, device=None):
 		# Append to list of negative log likelihoods
 		nlls.append(neg_log_likelihood)
 
-		gc.collect()
 		torch.cuda.empty_cache()
 
 	# Compute perplexity
@@ -136,7 +127,6 @@ def eval_ppl_test(model, testenc, bs=1, device=None):
 		# Append to list of negative log likelihoods
 		nlls.append(neg_log_likelihood)
 
-		gc.collect()
 		torch.cuda.empty_cache()
 
 	# Compute perplexity

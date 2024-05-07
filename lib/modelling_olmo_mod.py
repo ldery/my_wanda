@@ -250,17 +250,22 @@ class OlmoMLP(nn.Module):
 				self.intermed_cache = intermed_result.abs().view(-1, last_dim).mean(axis=0, keepdims=True).view(1, 1, -1)
 			elif self.prune_method == "wanda":
 				ins_ = intermed_result.view(-1, last_dim).to(torch.float32)
-				ins_ = (self.down_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
+				ins_ = (self.down_proj.weight.data.abs().to(torch.float32)) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
 				self.intermed_cache = ins_.mean(axis=0).view(1, 1, -1)
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Stopping")
 					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+			elif self.prune_method == "fluct":
+				ins_ = intermed_result.view(-1, last_dim)
+				ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).to(torch.float32).pow_(2).mean(dim=0, keepdim=True)
+				ins_ = (self.down_proj.weight.data.abs().to(torch.float32).pow_(2).mean(dim=0, keepdim=True)) * ins_
+				self.intermed_cache = ins_.view(1, 1, -1)
 			elif self.prune_method == "random":
 				self.intermed_cache = torch.rand((1, 1, self.intermediate_size)).to(x.device)
 
 			if self.computing_updated_bias is not None:
 				self.intermed_cache = intermed_result.view(-1, last_dim).mean(axis=0, keepdims=True) * (self.computing_updated_bias).squeeze(0)
-				self.intermed_cache = self.down_proj.weight.matmul(self.intermed_cache.T)
+				self.intermed_cache = (self.down_proj.weight).matmul(self.intermed_cache.T)
 
 		return self.down_proj(intermed_result)
 
@@ -420,17 +425,20 @@ class OlmoAttention(nn.Module):
 			attn_output = attn_output * self.temp_mask
 
 		if self.prune_method == "magnitude":
-			with torch.no_grad():
-				self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
+			self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
 		elif self.prune_method == "wanda":
-			with torch.no_grad():
-				ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
-				ins_ = (self.o_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
-				self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
+			ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+			ins_ = (self.o_proj.weight.data.abs().to(torch.float32)) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
+			self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 
-				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
-					print("We hit a nan or inf. Resettinig ")
-					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+			if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
+				print("We hit a nan or inf. Resettinig ")
+				self.intermed_cache = torch.zeros_like(self.intermed_cache)
+		elif self.prune_method == "fluct":
+			ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+			ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).pow_(2).mean(dim=0, keepdim=True)
+			ins_ = (self.o_proj.weight.data.abs().to(torch.float32).pow_(2).mean(dim=0, keepdim=True)) * ins_
+			self.intermed_cache = ins_.view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 		elif self.prune_method == "random":
 			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(attn_output.device)
 
@@ -754,17 +762,19 @@ class OlmoSdpaAttention(OlmoAttention):
 			attn_output = attn_output * self.temp_mask
 
 		if self.prune_method == "magnitude":
-			with torch.no_grad():
-				self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
+			self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
 		elif self.prune_method == "wanda":
-			with torch.no_grad():
-				ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
-				ins_ = (self.o_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
-				self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
-
-				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
-					print("We hit a nan or inf. Resettinig ")
-					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+			ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+			ins_ = (self.o_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
+			self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
+			if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
+				print("We hit a nan or inf. Resettinig ")
+				self.intermed_cache = torch.zeros_like(self.intermed_cache)
+		elif self.prune_method == "fluct":
+			ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+			ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).pow_(2).mean(dim=0, keepdim=True)
+			ins_ = (self.o_proj.weight.data.abs().to(torch.float32).pow_(2).mean(dim=0, keepdim=True)) * ins_
+			self.intermed_cache = ins_.view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 		elif self.prune_method == "random":
 			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(attn_output.device)
 

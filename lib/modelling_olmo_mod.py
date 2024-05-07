@@ -262,6 +262,8 @@ class OlmoMLP(nn.Module):
 				self.intermed_cache = ins_.view(1, 1, -1)
 			elif self.prune_method == "random":
 				self.intermed_cache = torch.rand((1, 1, self.intermediate_size)).to(x.device)
+			else:
+				self.intermed_cache = torch.zeros((1, 1, self.intermediate_size)).to(x.device)
 
 			if self.computing_updated_bias is not None:
 				self.intermed_cache = intermed_result.view(-1, last_dim).mean(axis=0, keepdims=True) * (self.computing_updated_bias).squeeze(0)
@@ -441,6 +443,8 @@ class OlmoAttention(nn.Module):
 			self.intermed_cache = ins_.view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 		elif self.prune_method == "random":
 			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(attn_output.device)
+		else:
+			self.intermed_cache = torch.zeros((1, 1, self.num_heads, 1)).to(attn_output.device)
 
 
 		if self.computing_updated_bias is not None:
@@ -777,6 +781,8 @@ class OlmoSdpaAttention(OlmoAttention):
 			self.intermed_cache = ins_.view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 		elif self.prune_method == "random":
 			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(attn_output.device)
+		else:
+			self.intermed_cache = torch.zeros((1, 1, self.num_heads, 1)).to(attn_output.device)
 
 
 		if self.computing_updated_bias is not None:

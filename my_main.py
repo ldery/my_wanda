@@ -159,52 +159,34 @@ def hook_fn(module_name, info_cache):
 
 def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='.',  model_type='local'):
 	score_map = {}
-	if model_type == 'local':
-		for id_, (name, module) in module_map.items():
-			# Get a score map
-			_, _, use_indices = all_sampling_proba[id_]
-			base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
-			base_mask = (base_mask.squeeze() * module.main_mask.squeeze().float())[use_indices]
-			base_mask = (base_mask / base_mask.sum()).view(-1, 1)
+	# do some global modelling here
+	# aggregate all the data here
+	xs = None
+	for id_, (name, module) in module_map.items():
+		if xs is None:
+			xs = score_perfs[0][id_]
+		else:
+			xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
+	xs = [k.cuda() for k in xs]
+	ys = score_perfs[1][id_]
 
-			sm_hp_searcher = ScoreModelHP(
-				id_='{}/{}'.format(parent_id, id_), num_players=score_perfs[0][id_][0].numel(),
-				base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
+	is_valid = np.array(ys) < INF
+	this_masks, this_scores = [], []
+	for idx, truth_val in enumerate(is_valid):
+		if truth_val:
+			this_masks.append(xs[idx])
+			this_scores.append(-np.log(-ys[idx]))
+	xs, ys = this_masks, this_scores
+	print('Total runs = {}, Total dropped = {}'.format(len(is_valid), len(is_valid) - sum(is_valid)))
 
-			run_info = score_perfs[0][id_], score_perfs[1][id_]
+	sm_hp_searcher = ScoreModelHP(
+			id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
+			base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
 
-			sm_hp_searcher.search_best_linear_fit(run_info)
-			score_map[id_] = sm_hp_searcher.get_best_fit()
-	else:
-		# do some global modelling here
-		# aggregate all the data here
-		xs = None
-		for id_, (name, module) in module_map.items():
-			if xs is None:
-				xs = score_perfs[0][id_]
-			else:
-				xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
-		xs = [k.cuda() for k in xs]
-		ys = score_perfs[1][id_]
+	sm_hp_searcher.search_best_linear_fit((xs, ys))
+	best_fit = sm_hp_searcher.get_best_fit()
+	score_map[model_type] = best_fit
 
-		is_valid = np.array(ys) < INF
-		this_masks, this_scores = [], []
-		for idx, truth_val in enumerate(is_valid):
-			if truth_val:
-				this_masks.append(xs[idx])
-				this_scores.append(-np.log(-ys[idx]))
-		xs, ys = this_masks, this_scores
-		print('Total runs = {}, Total dropped = {}'.format(len(is_valid), len(is_valid) - sum(is_valid)))
-# 		print(ys)
-# 		pdb.set_trace()
-
-		sm_hp_searcher = ScoreModelHP(
-				id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
-				base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
-
-		sm_hp_searcher.search_best_linear_fit((xs, ys))
-		best_fit = sm_hp_searcher.get_best_fit()
-		score_map[model_type] = best_fit 
 	return score_map
 
 def run_data_to_sampling_proba(info, module, pfrac):
@@ -315,6 +297,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 		this_pfrac = None if args.no_perturb else this_pfrac
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
+		module.prune_method = None # we are turning off gathering any pruning statistics
 
 	if not args.no_perturb: # We are not running a perturbation algorithm
 		# Clear the info-cache for the next round !

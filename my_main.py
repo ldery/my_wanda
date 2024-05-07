@@ -398,7 +398,6 @@ def args_to_dict(args):
 
 		'name': args.wandb_project_name,
 		'P-Seqlen': args.prune_seqlen,
-		'Inline-bias': args.inline_repair,
 		'bias_ns': args.bias_ns,
 		'prion_ns': args.prior_ns
 	}
@@ -585,7 +584,6 @@ def main():
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	parser.add_argument('--last-epoch', type=int, default=-1)
 	parser.add_argument('--repair_method', type=str, default='bias', choices=["none", "bias"])
-	parser.add_argument('--inline-repair', action='store_true', help="Whether or not to do repair inline.")
 
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
@@ -680,11 +678,6 @@ def main():
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
 		print(model)
 
-		# Evaluate the performance of the pruned model
-		if args.repair_method == 'bias' and args.inline_repair:
-			print('We are doing an inline repair of bias')
-			post_pruning_bias_fix(model, bias_info)
-
 		start_time = time()
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
@@ -703,7 +696,7 @@ def main():
 		if epoch_ == args.last_epoch:
 			break
 
-	if args.repair_method == 'bias' and not args.inline_repair:
+	if args.repair_method == 'bias':
 		post_pruning_bias_fix(model, bias_info)
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
 		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)

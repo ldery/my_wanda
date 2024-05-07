@@ -64,10 +64,14 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
 				this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
 				continue_ = False
 			except Exception as e:
-				print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
-				gc.collect()
-				torch.cuda.empty_cache()
-				this_bsz = max(1, this_bsz // 2)
+				if 'memory' in str(e):
+					print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
+					gc.collect()
+					torch.cuda.empty_cache()
+					this_bsz = max(1, this_bsz // 2)
+				else:
+					print(e)
+					exit()
 
 	return this_ppl, this_bsz
 
@@ -113,14 +117,17 @@ def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=1
 
 	return all_masks, all_perfs
 
+
 def get_llm(model_name, cache_dir="llm_weights", prune_seqlen=1024):
+
 	model = LlamaForCausalLM.from_pretrained(
-		model_name, 
-		torch_dtype=torch.float16, 
-		cache_dir=cache_dir, 
-		low_cpu_mem_usage=True, 
+		model_name,
+		torch_dtype=torch.float16,
+		cache_dir=cache_dir,
+		low_cpu_mem_usage=True,
 		device_map="auto"
 	)
+
 	model.seqlen = prune_seqlen
 	print('xx'*20)
 	print('This is the current model sequence length: ', model.seqlen)
@@ -142,40 +149,34 @@ def hook_fn(module_name, info_cache):
 
 def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='.',  model_type='local'):
 	score_map = {}
-	if model_type == 'local':
-		for id_, (name, module) in module_map.items():
-			# Get a score map
-			_, _, use_indices = all_sampling_proba[id_]
-			base_mask = info_cache[name]['in'][1] / info_cache[name]['in'][0]
-			base_mask = (base_mask.squeeze() * module.main_mask.squeeze().float())[use_indices]
-			base_mask = (base_mask / base_mask.sum()).view(-1, 1)
+	# do some global modelling here
+	# aggregate all the data here
+	xs = None
+	for id_, (name, module) in module_map.items():
+		if xs is None:
+			xs = score_perfs[0][id_]
+		else:
+			xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
+	xs = [k.cuda() for k in xs]
+	ys = score_perfs[1][id_]
 
-			sm_hp_searcher = ScoreModelHP(
-				id_='{}/{}'.format(parent_id, id_), num_players=score_perfs[0][id_][0].numel(),
-				base_mask=base_mask, hp_dict=hp_dict, wandb=wandb_run)
+	is_valid = np.array(ys) < INF
+	this_masks, this_scores = [], []
+	for idx, truth_val in enumerate(is_valid):
+		if truth_val:
+			this_masks.append(xs[idx])
+			this_scores.append(-np.log(-ys[idx]))
+	xs, ys = this_masks, this_scores
+	print('Total runs = {}, Total dropped = {}'.format(len(is_valid), len(is_valid) - sum(is_valid)))
 
-			run_info = score_perfs[0][id_], score_perfs[1][id_]
+	sm_hp_searcher = ScoreModelHP(
+			id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
+			base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
 
-			sm_hp_searcher.search_best_linear_fit(run_info)
-			score_map[id_] = sm_hp_searcher.get_best_fit()
-	else:
-		# do some global modelling here
-		# aggregate all the data here
-		xs = None
-		for id_, (name, module) in module_map.items():
-			if xs is None:
-				xs = score_perfs[0][id_]
-			else:
-				xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
-		xs = [k.cuda() for k in xs]
-		ys = score_perfs[1][id_]
-		sm_hp_searcher = ScoreModelHP(
-				id_='{}/{}'.format(parent_id, "Global"), num_players=xs[0].numel(),
-				base_mask=torch.zeros_like(xs[0]).view(-1, 1), hp_dict=hp_dict, wandb=wandb_run)
+	sm_hp_searcher.search_best_linear_fit((xs, ys))
+	best_fit = sm_hp_searcher.get_best_fit()
+	score_map[model_type] = best_fit
 
-		sm_hp_searcher.search_best_linear_fit((xs, ys))
-		best_fit = sm_hp_searcher.get_best_fit()
-		score_map[model_type] = best_fit 
 	return score_map
 
 def run_data_to_sampling_proba(info, module, pfrac):
@@ -286,6 +287,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 		this_pfrac = None if args.no_perturb else this_pfrac
 		all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
+		module.prune_method = None # we are turning off gathering any pruning statistics
 
 	if not args.no_perturb: # We are not running a perturbation algorithm
 		# Clear the info-cache for the next round !
@@ -339,8 +341,9 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 
 	
 	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt, no_regression=(args.sm_nepochs == 0))
-	wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
-	mask_info = {name: module.main_mask for _, (name, module) in module_map.items()}
+	if wandb_run is not None:
+		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
+	mask_info = {name: module.main_mask.clone() for _, (name, module) in module_map.items()}
 
 	for handle in hook_handles:
 		handle.remove()
@@ -361,14 +364,39 @@ def args_to_dict(args):
 		'Lin.regtype': args.sm_reg_type, 
 		'pmethod': args.prune_method,
 		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'Lin.regW': stringify(args.sm_reg_weight),
+		'Lin.regweight': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
 		'Lin.bsz': stringify(args.sm_bsz),
 		'Lin.nepochs': args.sm_nepochs,
 		'Lin.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name,
-		'P-Seqlen': args.prune_seqlen,
+		'Adaptive': 'Yes'
 	}
+
+# def args_to_dict(args):
+# 	def stringify(x):
+# 		return '-'.join([str(y) for y in eval(x)])
+
+# 	return {
+# 		'nsamp': args.nsamples,
+# 		'sp': args.sparsity_ratio,
+# 		'pfrac': args.prune_frac,
+# 		'bsz': args.bsz,
+# 		'mpi': args.masks_per_iter,
+# 		'pmethod': args.prune_method,
+
+# # 		'Lin.regtype': args.sm_reg_type, 
+# # 		'Lin.regW': stringify(args.sm_reg_weight),
+# # 		'Lin.lr': stringify(args.sm_lr_factor),
+# # 		'Lin.bsz': stringify(args.sm_bsz),
+# # 		'Lin.neps': args.sm_nepochs,
+# # 		'Lin.type': args.sm_lin_model_type,
+
+# 		'name': args.wandb_project_name,
+# 		'P-Seqlen': args.prune_seqlen,
+# 		'bias_ns': args.bias_ns,
+# 		'prion_ns': args.prior_ns
+# 	}
 
 def args_to_str(args):
 	relevant_args = args_to_dict(args)
@@ -415,9 +443,6 @@ def prune_mlp(mask_, module):
 		module.down_proj = new_down_proj
 		module.intermediate_size = len(index)
 
-	gc.collect()
-	torch.cuda.empty_cache()
-
 def prune_attn(mask_, module):
 
 	module.main_mask = None
@@ -461,12 +486,10 @@ def prune_attn(mask_, module):
 		module.o_proj = new_o_proj
 
 		module.num_heads = len(mask_.squeeze().nonzero())
+		module.num_key_value_heads = module.num_heads
 		module.hidden_size = module.num_heads * module.head_dim
 		module.intermediate_size = module.num_heads
 
-
-	gc.collect()
-	torch.cuda.empty_cache()
 
 def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info=None, epoch=1):
 	info_cache, hook_handles = defaultdict(dict), []
@@ -474,6 +497,9 @@ def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_i
 		for (name, module) in model.named_modules():
 			if name not in mask_info: continue # We are not pruning this
 
+			# Reset to the original before running
+			module.main_mask = None
+			module.temp_mask = None
 			module.computing_updated_bias = 1 - mask_info[name]
 			hook_handles.append(module.register_forward_hook(hook_fn(name, info_cache)))
 
@@ -514,10 +540,10 @@ def post_pruning_bias_fix(model, bias_info):
 	for name, module in model.named_modules():
 		if name.endswith('self_attn'):
 			device = module.o_proj.weight.device
-			module.o_proj.bias = torch.nn.Parameter((bias_info[name]).half())
+			module.o_proj.bias = torch.nn.Parameter((bias_info[name]).half().to(device))
 		elif name.endswith('mlp'):
 			device = module.down_proj.weight.device
-			module.down_proj.bias = torch.nn.Parameter((bias_info[name]).half())
+			module.down_proj.bias = torch.nn.Parameter((bias_info[name]).half().to(device))
 
 
 def main():
@@ -531,7 +557,7 @@ def main():
 	parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
 	parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
 
-	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random"])
+	parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random", "fluct"])
 	parser.add_argument("--cache_dir", default="llm_weights", type=str )
 	parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
 	parser.add_argument('--save', type=str, default=None, help='Path to save results.')
@@ -540,6 +566,8 @@ def main():
 	parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
 	parser.add_argument('--no_perturb', action="store_true", help="We do not perform any perturbation")
 	parser.add_argument('--prune_seqlen', type=int, default=-1, help='the sequence length to use for pruning')
+	parser.add_argument('--bias_ns', type=int, default=32, help='Number of samples to use when estimating bias')
+	parser.add_argument('--prior_ns', type=int, default=32, help='Number of samples to use when estimating prior')
 
 	# Hyperparams for scoring model
 	parser.add_argument('--sm_reg_weight', type=str, default='[1e2, 1e-4, 0]', help='reg-weight to use')
@@ -551,7 +579,7 @@ def main():
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
 	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
 	parser.add_argument('--last-epoch', type=int, default=-1)
-	parser.add_argument('--repair_method', type=str, default='none', choices=["none", "bias"])
+	parser.add_argument('--repair_method', type=str, default='bias', choices=["none", "bias"])
 
 	# Wandb HP
 	parser.add_argument('--wandb_project_name', type=str, default='Prune-No-Backward', help='Wandb project name')
@@ -579,11 +607,16 @@ def main():
 	if args.prune_seqlen < 0:
 		args.prune_seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen
 	model.eval()
-	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+	tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=('olmo' in args.model.lower()))
+
+	model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
+	# Get the test loader
+	trainloader, testloader = get_loaders(
+		args.dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
+	)
 
 	start_time = time()
-	model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-	orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
+	orig_train_ppl, orig_test_ppl = -1, -1 #eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
 	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))
@@ -593,17 +626,19 @@ def main():
 	if args.repair_method == 'bias':
 		bias_info = defaultdict(lambda: None)
 		bias_calibration_data, _ = get_loaders(
-			args.dataset, nsamples=args.nsamples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+			args.dataset, nsamples=args.bias_ns, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 		)
+		print("Done loading bias data")
 
 	# Get the full dataset that we are going to be passing around!
-	total_samples = args.nsamples * (int((args.sparsity_ratio / args.prune_frac)) + 4) # + 4 is a buffer in case the pruning ends up needing more steps
+	mul_factor = int((args.sparsity_ratio / args.prune_frac)) + 4 # + 4 is a buffer in case the pruning ends up needing more steps
+	total_samples = args.nsamples * mul_factor
+	prior_total_samples = args.prior_ns * mul_factor
 	full_dataset, _ = get_loaders(
-			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
+			args.dataset, nsamples=(total_samples + prior_total_samples), seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 	)
-	prior_dataset, _ = get_loaders(
-			args.dataset, nsamples=total_samples, seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
-	)
+	full_dataset, prior_dataset = full_dataset[:total_samples], full_dataset[total_samples:]
+	print("Done loading prior and perturbation data")
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
@@ -629,7 +664,7 @@ def main():
 				mask_info = pkl.load(handle)
 		else:
 			this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
-			this_prior = prior_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
+			this_prior = prior_dataset[(args.prior_ns * (epoch_ - 1)):(args.prior_ns * epoch_)]
 			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, this_prior, tokenizer, epoch_=epoch_)
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
@@ -640,18 +675,18 @@ def main():
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
 		print(model)
 
-		# Evaluate the performance of the pruned model
 		start_time = time()
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
+		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
 		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		pruned_model_runtime = time() - start_time
 
-		wandb_run.log({
-			'Relative-Speedup': original_runtime / pruned_model_runtime,
-		})
+		if wandb_run is not None:
+			wandb_run.log({
+				'Relative-Speedup': original_runtime / pruned_model_runtime,
+			})
 
-		wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
+			wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
 		print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
 
 		epoch_ += 1
@@ -661,12 +696,21 @@ def main():
 	if args.repair_method == 'bias':
 		post_pruning_bias_fix(model, bias_info)
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-		ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.dataset, bsz=args.bsz)
+		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
 		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
-		wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
 		print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
-		wandb_run.log({'sparsity': cur_sparsity})
+		if wandb_run is not None:
+			wandb_run.log({'Post-Bias-Fix-TrainPPL': ppl_train, 'Post-Bias-Fix-TestPPL': ppl_test})
+			wandb_run.log({'sparsity': cur_sparsity})
 
-
+import cProfile
+import pstats
 if __name__ == '__main__':
-    main()
+# 	with cProfile.Profile() as profile_ctxt:
+	main()
+# 	pdb.set_trace()
+# 	ps = pstats.Stats(profile_ctxt).strip_dirs().sort_stats('tottime')
+# 	ps.print_stats(20)
+# 	ps.print_caller(20)
+# 	pdb.set_trace()
+# 	ps.print_stats()

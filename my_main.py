@@ -194,6 +194,10 @@ def run_data_to_sampling_proba(info, module, pfrac):
 	sampling_proba = avg_act_magnitudes.cpu().squeeze().numpy()
 
 	num_keep_static = 0 if pfrac is None else int(len(sampling_proba)*(1.0 - 2*pfrac)) # hard coded to look at 2x the original pruning fraction
+	if pfrac >= 0.5: # In this case the above will be zero. 
+		assert num_keep_static <= 0, "We expect num_keep_static to be zero here"
+		num_keep_static = int(len(sampling_proba)*(0.3))
+
 	sorted_ = np.argsort(-sampling_proba)
 	fixed_indices, use_indices = sorted_[:num_keep_static], sorted_[num_keep_static:]
 
@@ -216,6 +220,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 	def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
 		score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
 		if regression_weights is None:
+			print("We are using the original info cache instead of the regression weights -- this should only be the case if --no_perturb is on")
 			regression_weights = (info['in'][1] / info['in'][0]).squeeze()
 			regression_weights = regression_weights[use_indices]
 
@@ -287,6 +292,10 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 	# Initial setup to get the initial probability distribution for sampling
 	get_train_ppl_multitry(model, data_for_prior, args.bsz)
 
+	# We should be able to safely remove hooks now
+	for handle in hook_handles:
+		handle.remove()
+
 	hp_dict = get_linearmodel_hpdict(args)
 	score_matrix = defaultdict(lambda: None)
 	all_sampling_proba = defaultdict(lambda: np.ones((intermediate_sz)))
@@ -300,10 +309,6 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 		module.prune_method = None # we are turning off gathering any pruning statistics
 
 	if not args.no_perturb: # We are not running a perturbation algorithm
-		# Clear the info-cache for the next round !
-		for k, v in info_cache.items():
-			info_cache[k] = dict()
-
 		start = time()
 		score_info = get_random_mask_scores(
 							model, dataset, module_map, all_sampling_proba,
@@ -349,14 +354,12 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 			start_idx += num_entries
 		preset_qt = 0
 
-	
+
 	compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt, no_regression=(args.sm_nepochs == 0))
 	if wandb_run is not None:
 		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask.clone() for _, (name, module) in module_map.items()}
 
-	for handle in hook_handles:
-		handle.remove()
 
 	return mask_info
 
@@ -371,6 +374,7 @@ def args_to_dict(args):
 		'bsz': args.bsz,
 		'mpi': args.masks_per_iter,
 		'pmethod': args.prune_method,
+		'repair': args.repair_method,
 
 # 		'Lin.regtype': args.sm_reg_type, 
 # 		'Lin.regW': stringify(args.sm_reg_weight),
@@ -515,7 +519,6 @@ def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_i
 		else:
 			raise ValueError("Invalid type found in mask_info : {}".format(name))
 
-		del new_param
 		module.computing_updated_bias = None
 
 	gc.collect()
@@ -603,7 +606,7 @@ def main():
 	)
 
 	start_time = time()
-	orig_train_ppl, orig_test_ppl = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
+	orig_train_ppl, orig_test_ppl = -1, -1 #eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
 	model.seqlen = args.prune_seqlen
 	original_runtime = time() - start_time
 	print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))
@@ -623,12 +626,14 @@ def main():
 	full_dataset, _ = get_loaders(
 			args.dataset, nsamples=(total_samples + prior_total_samples), seed=random.randint(0, 9999), seqlen=model.seqlen, tokenizer=tokenizer 
 	)
+
 	full_dataset, prior_dataset = full_dataset[:total_samples], full_dataset[total_samples:]
 
 
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
 	cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
+	prune_runtimes = []
 	epoch_ = 1
 	while True:
 		if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
@@ -651,7 +656,9 @@ def main():
 		else:
 			this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
 			this_prior = prior_dataset[(args.prior_ns * (epoch_ - 1)):(args.prior_ns * epoch_)]
+			start_time = time()
 			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, this_prior, tokenizer, epoch_=epoch_)
+			prune_runtimes.append(time() - start_time)
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
 				pkl.dump(mask_info, handle)
@@ -679,6 +686,7 @@ def main():
 		if epoch_ == args.last_epoch:
 			break
 
+	print("Each pruning iteration took on average : {:.3f}min".format(np.mean(prune_runtimes) / 60))
 	if args.repair_method == 'bias':
 		post_pruning_bias_fix(model, bias_info)
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation

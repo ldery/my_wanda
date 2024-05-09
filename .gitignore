@@ -5,6 +5,6 @@
 *.ipynb*
 *.csv
 llm_weights/
-out/
-process_results.sh
+out/*
+*.sh
 wandb/

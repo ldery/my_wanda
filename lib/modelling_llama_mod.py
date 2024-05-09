@@ -311,7 +311,7 @@ class LlamaMLP(nn.Module):
 			return torch.zeros_like(x)
 
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-		# TODO [ldery] -- work on a better normalization factor (might be more necessary for Mistral model)
+
 		if self.is_using_main and (self.main_mask is not None):
 			intermed_result = intermed_result * self.main_mask
 		elif (self.temp_mask is not None):

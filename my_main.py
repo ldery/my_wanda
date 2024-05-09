@@ -21,6 +21,7 @@ import wandb
 from transformers.pytorch_utils import  find_pruneable_heads_and_indices, prune_linear_layer
 import gc
 import random
+from pprint import pprint
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -295,7 +296,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 	if not args.no_perturb: # We are not running a perturbation algorithm
 		# Clear the info-cache for the next round !
 		for k, v in info_cache.items():
-			info_cache[k] = dict()
+			info_cache[k]['in'][1].zero_()
 
 		start = time()
 		score_info = get_random_mask_scores(
@@ -647,7 +648,7 @@ def main():
 		print('Prune model')
 		prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info, epoch=epoch_)
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
-		print(model)
+		pprint({k: v.shape for k, v in model.named_parameters()})
 
 		start_time = time()
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation

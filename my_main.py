@@ -359,44 +359,19 @@ def args_to_dict(args):
 		'sp': args.sparsity_ratio,
 		'pfrac': args.prune_frac,
 		'bsz': args.bsz,
-		'ma_ratio': args.mlp_attn_ratio,
 		'mpi': args.masks_per_iter,
-		'Lin.regtype': args.sm_reg_type, 
 		'pmethod': args.prune_method,
-		'mlp_attn_ratio': args.mlp_attn_ratio,
-		'Lin.regweight': stringify(args.sm_reg_weight),
+		'P-Seqlen': args.prune_seqlen,
+		'Lin.regtype': args.sm_reg_type, 
+		'Lin.regW': stringify(args.sm_reg_weight),
 		'Lin.lr': stringify(args.sm_lr_factor),
 		'Lin.bsz': stringify(args.sm_bsz),
-		'Lin.nepochs': args.sm_nepochs,
+		'Lin.neps': args.sm_nepochs,
 		'Lin.type': args.sm_lin_model_type,
 		'name': args.wandb_project_name,
-		'Adaptive': 'Yes'
+		'bias_ns': args.bias_ns,
+		'prion_ns': args.prior_ns
 	}
-
-# def args_to_dict(args):
-# 	def stringify(x):
-# 		return '-'.join([str(y) for y in eval(x)])
-
-# 	return {
-# 		'nsamp': args.nsamples,
-# 		'sp': args.sparsity_ratio,
-# 		'pfrac': args.prune_frac,
-# 		'bsz': args.bsz,
-# 		'mpi': args.masks_per_iter,
-# 		'pmethod': args.prune_method,
-
-# # 		'Lin.regtype': args.sm_reg_type, 
-# # 		'Lin.regW': stringify(args.sm_reg_weight),
-# # 		'Lin.lr': stringify(args.sm_lr_factor),
-# # 		'Lin.bsz': stringify(args.sm_bsz),
-# # 		'Lin.neps': args.sm_nepochs,
-# # 		'Lin.type': args.sm_lin_model_type,
-
-# 		'name': args.wandb_project_name,
-# 		'P-Seqlen': args.prune_seqlen,
-# 		'bias_ns': args.bias_ns,
-# 		'prion_ns': args.prior_ns
-# 	}
 
 def args_to_str(args):
 	relevant_args = args_to_dict(args)
@@ -589,7 +564,6 @@ def main():
 	str_of_args = args_to_str(args)
 	args.save = os.path.join(args.save, str_of_args)
 	os.makedirs(args.save, exist_ok=True)
-
 
 	# Setting seeds for reproducibility
 	np.random.seed(args.seed)

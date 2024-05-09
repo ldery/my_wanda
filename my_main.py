@@ -289,6 +289,9 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 		module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
 		module.prune_method = None # we are turning off gathering any pruning statistics
 
+	for handle in hook_handles:
+		handle.remove()
+
 	if not args.no_perturb: # We are not running a perturbation algorithm
 		# Clear the info-cache for the next round !
 		for k, v in info_cache.items():
@@ -344,9 +347,6 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 	if wandb_run is not None:
 		wandb_run.log({'SysStats/scoreruntime': gen_scores_time, 'SysStats/pruneruntime': time_delta})
 	mask_info = {name: module.main_mask.clone() for _, (name, module) in module_map.items()}
-
-	for handle in hook_handles:
-		handle.remove()
 
 	return mask_info
 

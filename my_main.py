@@ -296,7 +296,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
     if not args.no_perturb: # We are not running a perturbation algorithm
         # Clear the info-cache for the next round !
         for k, v in info_cache.items():
-            info_cache[k] = dict()
+            info_cache[k] = torch.zeros_like(info_cache[k]).squeeze()
 
         start = time()
         score_info = get_random_mask_scores(

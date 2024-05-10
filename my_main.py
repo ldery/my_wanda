@@ -76,7 +76,7 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
 
 	return this_ppl, this_bsz
 
-def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
+def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
 
 	# set to use main
 	for k, (name, module) in module_map.items():
@@ -84,33 +84,33 @@ def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=1
 
 	all_masks, all_perfs = defaultdict(list), defaultdict(list)
 	seed_ = random.randint(0, 1e4)
-	for iter_ in range(mpi // 2):
+	n_iters = (mpi // 2) if use_complement else mpi
+	for iter_ in range(n_iters):
 		this_bsz = bsz
 
 		# set the layer mask here
 		set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
 		this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
-
 		print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
 		this_ppl = this_ppl if this_ppl < INF else INF
-
 		for k, (name, module) in module_map.items():
 			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
 			all_perfs[k].append(-this_ppl)
 
-		# set the complement mask here
-		set_masks(
-			module_map, all_masks, all_sampling_proba, pfrac=pfrac,
-			mlp_attn_ratio=mlp_attn_ratio, use_complement=True
-		)
-		this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
+		if use_complement:
+			# set the complement mask here
+			set_masks(
+				module_map, all_masks, all_sampling_proba, pfrac=pfrac,
+				mlp_attn_ratio=mlp_attn_ratio, use_complement=True
+			)
+			this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
 
-		print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
-		this_ppl = this_ppl if this_ppl < INF else INF
+			print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
+			this_ppl = this_ppl if this_ppl < INF else INF
 
-		for k, (name, module) in module_map.items():
-			# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
-			all_perfs[k].append(-this_ppl)
+			for k, (name, module) in module_map.items():
+				# NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
+				all_perfs[k].append(-this_ppl)
 
 	# reset to use main
 	for k, (name, module) in module_map.items():

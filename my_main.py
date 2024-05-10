@@ -9,7 +9,8 @@ from time import time
 import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
-from lib.modelling_llama_mod import LlamaForCausalLM
+from lib.latest_modelling_llama import LlamaForCausalLM
+# from lib.modelling_llama_mod import LlamaForCausalLM
 from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly, eval_ppl_train
@@ -618,7 +619,7 @@ def main():
 	original_param_count = get_param_count(model)
 	model.original_param_count = original_param_count
 	cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
-	epoch_ = 1
+	epoch_, prune_runtimes = 1, []
 	while True:
 		if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
 			break
@@ -640,7 +641,9 @@ def main():
 		else:
 			this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
 			this_prior = prior_dataset[(args.prior_ns * (epoch_ - 1)):(args.prior_ns * epoch_)]
+			start_ = time()
 			mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, this_prior, tokenizer, epoch_=epoch_)
+			prune_runtimes.append(time() - start_)
 			# Save the mask info for the epoch
 			with open(save_loc, 'wb') as handle:
 				pkl.dump(mask_info, handle)
@@ -648,11 +651,11 @@ def main():
 		print('Prune model')
 		prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info, epoch=epoch_)
 		cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
-		pprint({k: v.shape for k, v in model.named_parameters()})
+		pprint({k: v.shape for k, v in model.named_parameters() if ('o_proj' in k) or ('down_proj' in k)})
 
 		start_time = time()
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
+		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=4)
 		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		pruned_model_runtime = time() - start_time
 
@@ -668,10 +671,11 @@ def main():
 		if epoch_ == args.last_epoch:
 			break
 
+	print('Pruning took {:.3f} min on average'.format(np.mean(prune_runtimes) / 60.0))
 	if args.repair_method == 'bias':
 		post_pruning_bias_fix(model, bias_info)
 		model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
+		ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=4)
 		model.seqlen = args.prune_seqlen # reset the seqlen for pruning
 		print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
 		if wandb_run is not None:

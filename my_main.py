@@ -317,6 +317,8 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 			module.main_mask = torch.ones_like(info_cache[name]['in'][1][0]).half()
 			if hasattr(module, 'num_key_value_heads'):
 				module.main_mask = module.main_mask.view(1, 1, module.num_heads, -1).mean(axis=-1, keepdim=True)
+			else:
+				module.main_mask = module.main_mask.view(1, 1, module.main_mask.shape[-1])
 		else:
 			module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
 		module.prune_method = None # we are turning off gathering any pruning statistics

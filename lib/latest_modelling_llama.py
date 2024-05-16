@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2024 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
 # and OPT implementations in this library. It has been modified from its
@@ -10,14 +10,14 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#	  http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch OLMo model."""
+"""PyTorch LLaMA model."""
 
 import math
 import warnings
@@ -27,12 +27,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
-from torch.nn import CrossEntropyLoss
-import pdb
-
-from transformers import AutoConfig
-
-
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
@@ -40,7 +35,10 @@ from transformers.modeling_attn_mask_utils import AttentionMaskConverter
 from transformers.modeling_outputs import (
 	BaseModelOutputWithPast,
 	CausalLMOutputWithPast,
+	QuestionAnsweringModelOutput,
+	SequenceClassifierOutputWithPast,
 )
+
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (
@@ -51,20 +49,20 @@ from transformers.utils import (
 	logging,
 	replace_return_docstrings,
 )
-from transformers.models.olmo import OlmoConfig
+import pdb
+from .configuration_llama import LlamaConfig
 
 
 if is_flash_attn_2_available():
-	print('We are using Flash Attention !')
 	from flash_attn import flash_attn_func, flash_attn_varlen_func
 	from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
+
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "OlmoConfig"
+_CONFIG_FOR_DOC = "LlamaConfig"
 
 
-# Copied from transformers.models.llama.modeling_llama._get_unpad_data
 def _get_unpad_data(attention_mask):
 	seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
 	indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -77,25 +75,27 @@ def _get_unpad_data(attention_mask):
 	)
 
 
-class OlmoLayerNorm(nn.Module):
-	"""LayerNorm but with no learnable weight or bias."""
-
-	def __init__(self, hidden_size: int) -> None:
+class LlamaRMSNorm(nn.Module):
+	def __init__(self, hidden_size, eps=1e-6):
+		"""
+		LlamaRMSNorm is equivalent to T5LayerNorm
+		"""
 		super().__init__()
-		self.normalized_shape = (hidden_size,)
+		self.weight = nn.Parameter(torch.ones(hidden_size))
+		self.variance_epsilon = eps
 
-	def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-		orig_dtype = hidden_states.dtype
-		return F.layer_norm(hidden_states.to(dtype=torch.float32), self.normalized_shape, None, None, eps=1e-5).to(
-			orig_dtype
-		)
+	def forward(self, hidden_states):
+		input_dtype = hidden_states.dtype
+		hidden_states = hidden_states.to(torch.float32)
+		variance = hidden_states.pow(2).mean(-1, keepdim=True)
+		hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+		return self.weight * hidden_states.to(input_dtype)
 
 
-ALL_LAYERNORM_LAYERS.append(OlmoLayerNorm)
+ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Olmo
-class OlmoRotaryEmbedding(nn.Module):
+class LlamaRotaryEmbedding(nn.Module):
 	def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
 		super().__init__()
 		self.scaling_factor = scaling_factor
@@ -118,7 +118,7 @@ class OlmoRotaryEmbedding(nn.Module):
 	def sin_cached(self):
 		logger.warning_once(
 			"The sin_cached attribute will be removed in 4.39. Bear in mind that its contents changed in v4.38. Use "
-			"the forward method of RoPE from now on instead. It is not used in the `OlmoAttention` class"
+			"the forward method of RoPE from now on instead. It is not used in the `LlamaAttention` class"
 		)
 		return self._sin_cached
 
@@ -126,7 +126,7 @@ class OlmoRotaryEmbedding(nn.Module):
 	def cos_cached(self):
 		logger.warning_once(
 			"The cos_cached attribute will be removed in 4.39. Bear in mind that its contents changed in v4.38. Use "
-			"the forward method of RoPE from now on instead. It is not used in the `OlmoAttention` class"
+			"the forward method of RoPE from now on instead. It is not used in the `LlamaAttention` class"
 		)
 		return self._cos_cached
 
@@ -147,9 +147,8 @@ class OlmoRotaryEmbedding(nn.Module):
 		return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaLinearScalingRotaryEmbedding with Llama->Olmo
-class OlmoLinearScalingRotaryEmbedding(OlmoRotaryEmbedding):
-	"""OlmoRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
+class LlamaLinearScalingRotaryEmbedding(LlamaRotaryEmbedding):
+	"""LlamaRotaryEmbedding extended with linear scaling. Credits to the Reddit user /u/kaiokendev"""
 
 	def forward(self, x, position_ids):
 		# difference to the original RoPE: a scaling factor is aplied to the position ids
@@ -158,9 +157,8 @@ class OlmoLinearScalingRotaryEmbedding(OlmoRotaryEmbedding):
 		return cos, sin
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaDynamicNTKScalingRotaryEmbedding with Llama->Olmo
-class OlmoDynamicNTKScalingRotaryEmbedding(OlmoRotaryEmbedding):
-	"""OlmoRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
+class LlamaDynamicNTKScalingRotaryEmbedding(LlamaRotaryEmbedding):
+	"""LlamaRotaryEmbedding extended with Dynamic NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla"""
 
 	def forward(self, x, position_ids):
 		# difference to the original RoPE: inv_freq is recomputed when the sequence length > original length
@@ -178,7 +176,6 @@ class OlmoDynamicNTKScalingRotaryEmbedding(OlmoRotaryEmbedding):
 		return cos, sin
 
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
 	"""Rotates half the hidden dims of the input."""
 	x1 = x[..., : x.shape[-1] // 2]
@@ -186,7 +183,6 @@ def rotate_half(x):
 	return torch.cat((-x2, x1), dim=-1)
 
 
-# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 	"""Applies Rotary Position Embedding to the query and key tensors.
 
@@ -214,15 +210,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 	return q_embed, k_embed
 
 
-class OlmoMLP(nn.Module):
+class LlamaMLP(nn.Module):
 	def __init__(self, config):
 		super().__init__()
 		self.config = config
 		self.hidden_size = config.hidden_size
 		self.intermediate_size = config.intermediate_size
-		self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-		self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-		self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+		self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+		self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+		self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
 		self.act_fn = ACT2FN[config.hidden_act]
 
 		self.main_mask = None
@@ -236,7 +232,7 @@ class OlmoMLP(nn.Module):
 	def forward(self, x):
 		if self.skip_computation:
 			return torch.zeros_like(x)
-		
+
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
 		if self.is_using_main and (self.main_mask is not None):
 			intermed_result = intermed_result * self.main_mask
@@ -278,7 +274,6 @@ class OlmoMLP(nn.Module):
 		return self.down_proj(intermed_result)
 
 
-# Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 	"""
 	This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -291,11 +286,10 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 	return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-class OlmoAttention(nn.Module):
+class LlamaAttention(nn.Module):
 	"""Multi-headed attention from 'Attention Is All You Need' paper"""
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaAttention.__init__ with Llama->Olmo
-	def __init__(self, config: OlmoConfig, layer_idx: Optional[int] = None):
+	def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
 		super().__init__()
 		self.config = config
 		self.layer_idx = layer_idx
@@ -337,10 +331,9 @@ class OlmoAttention(nn.Module):
 		self.skip_computation = False
 		self.computing_updated_bias = None
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaAttention._init_rope with Llama->Olmo
 	def _init_rope(self):
 		if self.config.rope_scaling is None:
-			self.rotary_emb = OlmoRotaryEmbedding(
+			self.rotary_emb = LlamaRotaryEmbedding(
 				self.head_dim,
 				max_position_embeddings=self.max_position_embeddings,
 				base=self.rope_theta,
@@ -349,14 +342,14 @@ class OlmoAttention(nn.Module):
 			scaling_type = self.config.rope_scaling["type"]
 			scaling_factor = self.config.rope_scaling["factor"]
 			if scaling_type == "linear":
-				self.rotary_emb = OlmoLinearScalingRotaryEmbedding(
+				self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
 					self.head_dim,
 					max_position_embeddings=self.max_position_embeddings,
 					scaling_factor=scaling_factor,
 					base=self.rope_theta,
 				)
 			elif scaling_type == "dynamic":
-				self.rotary_emb = OlmoDynamicNTKScalingRotaryEmbedding(
+				self.rotary_emb = LlamaDynamicNTKScalingRotaryEmbedding(
 					self.head_dim,
 					max_position_embeddings=self.max_position_embeddings,
 					scaling_factor=scaling_factor,
@@ -376,21 +369,33 @@ class OlmoAttention(nn.Module):
 		cache_position: Optional[torch.LongTensor] = None,
 		**kwargs,
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-		
+		bsz, q_len, _ = hidden_states.size()
+
 		if self.skip_computation:
 			attn_output = torch.zeros_like(hidden_states)
 			return attn_output, None, None
 
-		bsz, q_len, _ = hidden_states.size()
+		if self.config.pretraining_tp > 1:
+			key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+			query_slices = self.q_proj.weight.split(
+				(self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+			)
+			key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+			value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
 
-		query_states = self.q_proj(hidden_states)
-		key_states = self.k_proj(hidden_states)
-		value_states = self.v_proj(hidden_states)
+			query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+			query_states = torch.cat(query_states, dim=-1)
 
-		if self.config.clip_qkv is not None:
-			query_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
-			key_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
-			value_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
+			key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+			key_states = torch.cat(key_states, dim=-1)
+
+			value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
+			value_states = torch.cat(value_states, dim=-1)
+
+		else:
+			query_states = self.q_proj(hidden_states)
+			key_states = self.k_proj(hidden_states)
+			value_states = self.v_proj(hidden_states)
 
 		query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 		key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -410,7 +415,7 @@ class OlmoAttention(nn.Module):
 
 		attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-		if attention_mask is not None:  # no matter the length, we just slice it
+		if attention_mask is not None:	# no matter the length, we just slice it
 			causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 			attn_weights = attn_weights + causal_mask
 
@@ -447,6 +452,12 @@ class OlmoAttention(nn.Module):
 			ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).pow_(2).mean(dim=0, keepdim=True)
 			ins_ = (self.o_proj.weight.data.abs().to(torch.float32).pow_(2).mean(dim=0, keepdim=True)) * ins_
 			self.intermed_cache = ins_.view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
+		elif self.prune_method == "fluct.2.0":
+			module_contribution = self.o_proj.weight.data.to(torch.float32).pow_(2).mean(dim=0, keepdim=True)
+			ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+			ins_mean = ins_.mean(dim=0, keepdim=True) * module_contribution
+			ins_sq = ins_.pow_(2).mean(dim=0, keepdim=True) * module_contribution
+			self.intermed_cache = (ins_mean, ins_sq)
 		elif self.prune_method == "random":
 			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(attn_output.device)
 		else:
@@ -459,8 +470,15 @@ class OlmoAttention(nn.Module):
 			self.intermed_cache = (self.intermed_cache * self.computing_updated_bias).view(1, -1)
 			self.intermed_cache = self.intermed_cache.matmul(self.o_proj.weight.T)
 
+
 		attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-		attn_output = self.o_proj(attn_output)
+
+		if self.config.pretraining_tp > 1:
+			attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+			o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+			attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+		else:
+			attn_output = self.o_proj(attn_output)
 
 		if not output_attentions:
 			attn_weights = None
@@ -468,14 +486,13 @@ class OlmoAttention(nn.Module):
 		return attn_output, attn_weights, past_key_value
 
 
-class OlmoFlashAttention2(OlmoAttention):
+class LlamaFlashAttention2(LlamaAttention):
 	"""
-	OLMo flash attention module. This module inherits from `OlmoAttention` as the weights of the module stays
+	Llama flash attention module. This module inherits from `LlamaAttention` as the weights of the module stays
 	untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
 	flash attention and deal with padding tokens in case the input contains any of them.
 	"""
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2.__init__
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
 
@@ -495,6 +512,12 @@ class OlmoFlashAttention2(OlmoAttention):
 		cache_position: Optional[torch.LongTensor] = None,
 		**kwargs,
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+		if isinstance(past_key_value, StaticCache):
+			raise ValueError(
+				"`static` cache implementation is not compatible with `attn_implementation==flash_attention_2` "
+				"make sure to use `sdpa` in the mean time, and open an issue at https://github.com/huggingface/transformers"
+			)
+
 		output_attentions = False
 
 		bsz, q_len, _ = hidden_states.size()
@@ -502,11 +525,6 @@ class OlmoFlashAttention2(OlmoAttention):
 		query_states = self.q_proj(hidden_states)
 		key_states = self.k_proj(hidden_states)
 		value_states = self.v_proj(hidden_states)
-
-		if self.config.clip_qkv is not None:
-			query_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
-			key_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
-			value_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
 
 		# Flash attention requires the input to have the shape
 		# batch_size x seq_length x head_dim x hidden_dim
@@ -537,7 +555,7 @@ class OlmoFlashAttention2(OlmoAttention):
 		# therefore the input hidden states gets silently casted in float32. Hence, we need
 		# cast them back in the correct dtype just to be sure everything works as expected.
 		# This might slowdown training & inference so it is recommended to not cast the LayerNorms
-		# in fp32. (OlmoRMSNorm handles it correctly)
+		# in fp32. (LlamaRMSNorm handles it correctly)
 
 		input_dtype = query_states.dtype
 		if input_dtype == torch.float32:
@@ -571,7 +589,6 @@ class OlmoFlashAttention2(OlmoAttention):
 
 		return attn_output, attn_weights, past_key_value
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2._flash_attention_forward with Llama->Olmo
 	def _flash_attention_forward(
 		self, query_states, key_states, value_states, attention_mask, query_length, dropout=0.0, softmax_scale=None
 	):
@@ -597,7 +614,7 @@ class OlmoFlashAttention2(OlmoAttention):
 		if not self._flash_attn_uses_top_left_mask:
 			causal = self.is_causal
 		else:
-			# TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in OlmoFlashAttention2 __init__.
+			# TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LlamaFlashAttention2 __init__.
 			causal = self.is_causal and query_length != 1
 
 		# Contains at least one padding token in the sequence
@@ -631,7 +648,6 @@ class OlmoFlashAttention2(OlmoAttention):
 
 		return attn_output
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaFlashAttention2._upad_input
 	def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
 		indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
 		batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
@@ -671,14 +687,14 @@ class OlmoFlashAttention2(OlmoAttention):
 		)
 
 
-class OlmoSdpaAttention(OlmoAttention):
+class LlamaSdpaAttention(LlamaAttention):
 	"""
-	OLMo attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-	`OlmoAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+	Llama attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+	`LlamaAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
 	SDPA API.
 	"""
 
-	# Adapted from OlmoAttention.forward
+	# Adapted from LlamaAttention.forward
 	def forward(
 		self,
 		hidden_states: torch.Tensor,
@@ -689,15 +705,10 @@ class OlmoSdpaAttention(OlmoAttention):
 		use_cache: bool = False,
 		cache_position: Optional[torch.LongTensor] = None,
 	) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
-		if self.skip_computation:
-			attn_output = torch.zeros_like(hidden_states)
-			return attn_output, None, None
-
 		if output_attentions:
 			# TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
 			logger.warning_once(
-				"OlmoModel is using OlmoSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+				"LlamaModel is using LlamaSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
 				'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
 			)
 			return super().forward(
@@ -710,16 +721,15 @@ class OlmoSdpaAttention(OlmoAttention):
 				cache_position=cache_position,
 			)
 
+		if self.skip_computation:
+			attn_output = torch.zeros_like(hidden_states)
+			return attn_output, None, None
+
 		bsz, q_len, _ = hidden_states.size()
 
 		query_states = self.q_proj(hidden_states)
 		key_states = self.k_proj(hidden_states)
 		value_states = self.v_proj(hidden_states)
-
-		if self.config.clip_qkv is not None:
-			query_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
-			key_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
-			value_states.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
 
 		query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
 		key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -740,7 +750,6 @@ class OlmoSdpaAttention(OlmoAttention):
 		value_states = repeat_kv(value_states, self.num_key_value_groups)
 
 		causal_mask = attention_mask
-		# if attention_mask is not None and cache_position is not None:
 		if attention_mask is not None:
 			causal_mask = causal_mask[:, :, :, : key_states.shape[-2]]
 
@@ -796,7 +805,6 @@ class OlmoSdpaAttention(OlmoAttention):
 		else:
 			self.intermed_cache = torch.zeros((1, 1, self.num_heads, 1)).to(attn_output.device)
 
-
 		if self.computing_updated_bias is not None:
 			shape = attn_output.shape[-2:]
 			self.intermed_cache = attn_output.reshape(-1, shape[0], shape[1]).mean(axis=0, keepdims=True).unsqueeze(0)
@@ -810,24 +818,24 @@ class OlmoSdpaAttention(OlmoAttention):
 		return attn_output, None, past_key_value
 
 
-OLMO_ATTENTION_CLASSES = {
-	"eager": OlmoAttention,
-	"flash_attention_2": OlmoFlashAttention2,
-	"sdpa": OlmoSdpaAttention,
+LLAMA_ATTENTION_CLASSES = {
+	"eager": LlamaAttention,
+	"flash_attention_2": LlamaFlashAttention2,
+	"sdpa": LlamaSdpaAttention,
 }
 
-class OlmoDecoderLayer(nn.Module):
-	def __init__(self, config: OlmoConfig, layer_idx: int):
+
+class LlamaDecoderLayer(nn.Module):
+	def __init__(self, config: LlamaConfig, layer_idx: int):
 		super().__init__()
 		self.hidden_size = config.hidden_size
 
-		self.self_attn = OLMO_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+		self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
-		self.mlp = OlmoMLP(config)
-		self.input_layernorm = OlmoLayerNorm(config.hidden_size)
-		self.post_attention_layernorm = OlmoLayerNorm(config.hidden_size)
+		self.mlp = LlamaMLP(config)
+		self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward
 	def forward(
 		self,
 		hidden_states: torch.Tensor,
@@ -892,7 +900,7 @@ class OlmoDecoderLayer(nn.Module):
 		return outputs
 
 
-OLMO_START_DOCSTRING = r"""
+LLAMA_START_DOCSTRING = r"""
 	This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
 	library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
 	etc.)
@@ -902,7 +910,7 @@ OLMO_START_DOCSTRING = r"""
 	and behavior.
 
 	Parameters:
-		config ([`OlmoConfig`]):
+		config ([`LlamaConfig`]):
 			Model configuration class with all the parameters of the model. Initializing with a config file does not
 			load the weights associated with the model, only the configuration. Check out the
 			[`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -910,15 +918,14 @@ OLMO_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-	"The bare Olmo Model outputting raw hidden-states without any specific head on top.",
-	OLMO_START_DOCSTRING,
+	"The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
+	LLAMA_START_DOCSTRING,
 )
-# Copied from transformers.models.llama.modeling_llama.LlamaPreTrainedModel with Llama->Olmo
-class OlmoPreTrainedModel(PreTrainedModel):
-	config_class = OlmoConfig
+class LlamaPreTrainedModel(PreTrainedModel):
+	config_class = LlamaConfig
 	base_model_prefix = "model"
 	supports_gradient_checkpointing = True
-	_no_split_modules = ["OlmoDecoderLayer"]
+	_no_split_modules = ["LlamaDecoderLayer"]
 	_skip_keys_device_placement = ["past_key_values"]
 	_supports_flash_attn_2 = True
 	_supports_sdpa = True
@@ -936,7 +943,7 @@ class OlmoPreTrainedModel(PreTrainedModel):
 				module.weight.data[module.padding_idx].zero_()
 
 
-OLMO_INPUTS_DOCSTRING = r"""
+LLAMA_INPUTS_DOCSTRING = r"""
 	Args:
 		input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
 			Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1011,35 +1018,33 @@ OLMO_INPUTS_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-	"The bare Olmo Model outputting raw hidden-states without any specific head on top.",
-	OLMO_START_DOCSTRING,
+	"The bare LLaMA Model outputting raw hidden-states without any specific head on top.",
+	LLAMA_START_DOCSTRING,
 )
-class OlmoModel(OlmoPreTrainedModel):
+class LlamaModel(LlamaPreTrainedModel):
 	"""
-	Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`OlmoDecoderLayer`]
+	Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
 
 	Args:
-		config: OlmoConfig
+		config: LlamaConfig
 	"""
 
-	def __init__(self, config: OlmoConfig):
+	def __init__(self, config: LlamaConfig):
 		super().__init__(config)
 		self.padding_idx = config.pad_token_id
 		self.vocab_size = config.vocab_size
 
 		self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 		self.layers = nn.ModuleList(
-			[OlmoDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+			[LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
 		)
-		self.norm = OlmoLayerNorm(config.hidden_size)
+		self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+		self.gradient_checkpointing = False
 
 		# Do some setup to compute size of important units here
 		self.params_per_pruned_hidden = config.hidden_size * 3 # [gate_proj, up_proj, down_projs]
-		
 		head_dim = config.hidden_size // config.num_attention_heads
 		self.params_per_pruned_head = (head_dim * config.hidden_size) * 4 #(num parameters per-head) * [3 (kqv) + 1(o)]
-		
-		self.gradient_checkpointing = False
 
 		# Initialize weights and apply final processing
 		self.post_init()
@@ -1050,8 +1055,7 @@ class OlmoModel(OlmoPreTrainedModel):
 	def set_input_embeddings(self, value):
 		self.embed_tokens = value
 
-	@add_start_docstrings_to_model_forward(OLMO_INPUTS_DOCSTRING)
-	# Copied from transformers.models.llama.modeling_llama.LlamaModel.forward
+	@add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
 	def forward(
 		self,
 		input_ids: torch.LongTensor = None,
@@ -1086,7 +1090,9 @@ class OlmoModel(OlmoPreTrainedModel):
 		if inputs_embeds is None:
 			inputs_embeds = self.embed_tokens(input_ids)
 
+		return_legacy_cache = False
 		if use_cache and not isinstance(past_key_values, Cache):  # kept for BC (non `Cache` `past_key_values` inputs)
+			return_legacy_cache = True
 			past_key_values = DynamicCache.from_legacy_cache(past_key_values)
 
 		if cache_position is None:
@@ -1147,13 +1153,10 @@ class OlmoModel(OlmoPreTrainedModel):
 		if output_hidden_states:
 			all_hidden_states += (hidden_states,)
 
-		next_cache = None
-		if use_cache:
-			next_cache = (
-				next_decoder_cache.to_legacy_cache()
-				if isinstance(next_decoder_cache, DynamicCache)
-				else next_decoder_cache
-			)
+		next_cache = next_decoder_cache if use_cache else None
+		if return_legacy_cache:
+			next_cache = next_cache.to_legacy_cache()
+
 		if not return_dict:
 			return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
 		return BaseModelOutputWithPast(
@@ -1163,7 +1166,6 @@ class OlmoModel(OlmoPreTrainedModel):
 			attentions=all_self_attns,
 		)
 
-	# Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
 	def _update_causal_mask(
 		self,
 		attention_mask: torch.Tensor,
@@ -1216,8 +1218,11 @@ class OlmoModel(OlmoPreTrainedModel):
 			causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
 			if attention_mask.dim() == 2:
 				mask_length = attention_mask.shape[-1]
-				padding_mask = causal_mask[..., :mask_length].eq(0.0) * attention_mask[:, None, None, :].eq(0.0)
-				causal_mask[..., :mask_length] = causal_mask[..., :mask_length].masked_fill(padding_mask, min_dtype)
+				padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+				padding_mask = padding_mask == 0
+				causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+					padding_mask, min_dtype
+				)
 			elif attention_mask.dim() == 4:
 				# backwards compatibility: we allow passing a 4D attention mask shorter than the input length with
 				# cache. In that case, the 4D attention mask attends to the newest tokens only.
@@ -1248,13 +1253,12 @@ class OlmoModel(OlmoPreTrainedModel):
 		return causal_mask
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM with LLAMA->OLMO,Llama->Olmo
-class OlmoForCausalLM(OlmoPreTrainedModel):
+class LlamaForCausalLM(LlamaPreTrainedModel):
 	_tied_weights_keys = ["lm_head.weight"]
 
 	def __init__(self, config):
 		super().__init__(config)
-		self.model = OlmoModel(config)
+		self.model = LlamaModel(config)
 		self.vocab_size = config.vocab_size
 		self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -1279,15 +1283,14 @@ class OlmoForCausalLM(OlmoPreTrainedModel):
 	def get_decoder(self):
 		return self.model
 
-	@add_start_docstrings_to_model_forward(OLMO_INPUTS_DOCSTRING)
+	@add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
 	@replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
-	# Ignore copy
 	def forward(
 		self,
 		input_ids: torch.LongTensor = None,
 		attention_mask: Optional[torch.Tensor] = None,
 		position_ids: Optional[torch.LongTensor] = None,
-		past_key_values: Optional[List[torch.FloatTensor]] = None,
+		past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
 		inputs_embeds: Optional[torch.FloatTensor] = None,
 		labels: Optional[torch.LongTensor] = None,
 		use_cache: Optional[bool] = None,
@@ -1308,10 +1311,10 @@ class OlmoForCausalLM(OlmoPreTrainedModel):
 		Example:
 
 		```python
-		>>> from transformers import AutoTokenizer, OlmoForCausalLM
+		>>> from transformers import AutoTokenizer, LlamaForCausalLM
 
-		>>> model = OlmoForCausalLM.from_pretrained("allenai/OLMo-1B-hf")
-		>>> tokenizer = AutoTokenizer.from_pretrained("allenai/OLMo-1B-hf")
+		>>> model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+		>>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 
 		>>> prompt = "Hey, are you conscious? Can you talk to me?"
 		>>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -1319,9 +1322,8 @@ class OlmoForCausalLM(OlmoPreTrainedModel):
 		>>> # Generate
 		>>> generate_ids = model.generate(inputs.input_ids, max_length=30)
 		>>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-		'Hey, are you conscious? Can you talk to me?\nI’m not sure if you’re conscious of this, but I’m'
-		```
-		"""
+		"Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+		```"""
 		output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
 		output_hidden_states = (
 			output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1343,7 +1345,12 @@ class OlmoForCausalLM(OlmoPreTrainedModel):
 		)
 
 		hidden_states = outputs[0]
-		logits = self.lm_head(hidden_states)
+		if self.config.pretraining_tp > 1:
+			lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+			logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+			logits = torch.cat(logits, dim=-1)
+		else:
+			logits = self.lm_head(hidden_states)
 		logits = logits.float()
 
 		loss = None
@@ -1457,3 +1464,225 @@ class OlmoForCausalLM(OlmoPreTrainedModel):
 				tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
 			)
 		return reordered_past
+
+
+@add_start_docstrings(
+	"""
+	The LLaMa Model transformer with a sequence classification head on top (linear layer).
+
+	[`LlamaForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+	(e.g. GPT-2) do.
+
+	Since it does classification on the last token, it requires to know the position of the last token. If a
+	`pad_token_id` is defined in the configuration, it finds the last token that is not a padding token in each row. If
+	no `pad_token_id` is defined, it simply takes the last value in each row of the batch. Since it cannot guess the
+	padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
+	each row of the batch).
+	""",
+	LLAMA_START_DOCSTRING,
+)
+class LlamaForSequenceClassification(LlamaPreTrainedModel):
+	def __init__(self, config):
+		super().__init__(config)
+		self.num_labels = config.num_labels
+		self.model = LlamaModel(config)
+		self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+
+		# Initialize weights and apply final processing
+		self.post_init()
+
+	def get_input_embeddings(self):
+		return self.model.embed_tokens
+
+	def set_input_embeddings(self, value):
+		self.model.embed_tokens = value
+
+	@add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+	def forward(
+		self,
+		input_ids: torch.LongTensor = None,
+		attention_mask: Optional[torch.Tensor] = None,
+		position_ids: Optional[torch.LongTensor] = None,
+		past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+		inputs_embeds: Optional[torch.FloatTensor] = None,
+		labels: Optional[torch.LongTensor] = None,
+		use_cache: Optional[bool] = None,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		return_dict: Optional[bool] = None,
+	) -> Union[Tuple, SequenceClassifierOutputWithPast]:
+		r"""
+		labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+			Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+			config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+			`config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+		"""
+		return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+		transformer_outputs = self.model(
+			input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			past_key_values=past_key_values,
+			inputs_embeds=inputs_embeds,
+			use_cache=use_cache,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+		)
+		hidden_states = transformer_outputs[0]
+		logits = self.score(hidden_states)
+
+		if input_ids is not None:
+			batch_size = input_ids.shape[0]
+		else:
+			batch_size = inputs_embeds.shape[0]
+
+		if self.config.pad_token_id is None and batch_size != 1:
+			raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+		if self.config.pad_token_id is None:
+			sequence_lengths = -1
+		else:
+			if input_ids is not None:
+				# if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
+				sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+				sequence_lengths = sequence_lengths % input_ids.shape[-1]
+				sequence_lengths = sequence_lengths.to(logits.device)
+			else:
+				sequence_lengths = -1
+
+		pooled_logits = logits[torch.arange(batch_size, device=logits.device), sequence_lengths]
+
+		loss = None
+		if labels is not None:
+			labels = labels.to(logits.device)
+			if self.config.problem_type is None:
+				if self.num_labels == 1:
+					self.config.problem_type = "regression"
+				elif self.num_labels > 1 and (labels.dtype == torch.long or labels.dtype == torch.int):
+					self.config.problem_type = "single_label_classification"
+				else:
+					self.config.problem_type = "multi_label_classification"
+
+			if self.config.problem_type == "regression":
+				loss_fct = MSELoss()
+				if self.num_labels == 1:
+					loss = loss_fct(pooled_logits.squeeze(), labels.squeeze())
+				else:
+					loss = loss_fct(pooled_logits, labels)
+			elif self.config.problem_type == "single_label_classification":
+				loss_fct = CrossEntropyLoss()
+				loss = loss_fct(pooled_logits.view(-1, self.num_labels), labels.view(-1))
+			elif self.config.problem_type == "multi_label_classification":
+				loss_fct = BCEWithLogitsLoss()
+				loss = loss_fct(pooled_logits, labels)
+		if not return_dict:
+			output = (pooled_logits,) + transformer_outputs[1:]
+			return ((loss,) + output) if loss is not None else output
+
+		return SequenceClassifierOutputWithPast(
+			loss=loss,
+			logits=pooled_logits,
+			past_key_values=transformer_outputs.past_key_values,
+			hidden_states=transformer_outputs.hidden_states,
+			attentions=transformer_outputs.attentions,
+		)
+
+
+@add_start_docstrings(
+	"""
+The Llama Model transformer with a span classification head on top for extractive question-answering tasks like
+SQuAD (a linear layer on top of the hidden-states output to compute `span start logits` and `span end logits`).
+	""",
+	LLAMA_START_DOCSTRING,
+)
+class LlamaForQuestionAnswering(LlamaPreTrainedModel):
+	base_model_prefix = "transformer"
+
+	# Copied from transformers.models.bloom.modeling_bloom.BloomForQuestionAnswering.__init__ with Bloom->Llama
+	def __init__(self, config):
+		super().__init__(config)
+		self.transformer = LlamaModel(config)
+		self.qa_outputs = nn.Linear(config.hidden_size, 2)
+
+		# Initialize weights and apply final processing
+		self.post_init()
+
+	def get_input_embeddings(self):
+		return self.transformer.embed_tokens
+
+	def set_input_embeddings(self, value):
+		self.transformer.embed_tokens = value
+
+	@add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
+	def forward(
+		self,
+		input_ids: Optional[torch.LongTensor] = None,
+		attention_mask: Optional[torch.FloatTensor] = None,
+		position_ids: Optional[torch.LongTensor] = None,
+		past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+		inputs_embeds: Optional[torch.FloatTensor] = None,
+		start_positions: Optional[torch.LongTensor] = None,
+		end_positions: Optional[torch.LongTensor] = None,
+		output_attentions: Optional[bool] = None,
+		output_hidden_states: Optional[bool] = None,
+		return_dict: Optional[bool] = None,
+	) -> Union[Tuple, QuestionAnsweringModelOutput]:
+		r"""
+		start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+			Labels for position (index) of the start of the labelled span for computing the token classification loss.
+			Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+			are not taken into account for computing the loss.
+		end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+			Labels for position (index) of the end of the labelled span for computing the token classification loss.
+			Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+			are not taken into account for computing the loss.
+		"""
+		return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+		outputs = self.transformer(
+			input_ids,
+			attention_mask=attention_mask,
+			position_ids=position_ids,
+			past_key_values=past_key_values,
+			inputs_embeds=inputs_embeds,
+			output_attentions=output_attentions,
+			output_hidden_states=output_hidden_states,
+			return_dict=return_dict,
+		)
+
+		sequence_output = outputs[0]
+
+		logits = self.qa_outputs(sequence_output)
+		start_logits, end_logits = logits.split(1, dim=-1)
+		start_logits = start_logits.squeeze(-1).contiguous()
+		end_logits = end_logits.squeeze(-1).contiguous()
+
+		total_loss = None
+		if start_positions is not None and end_positions is not None:
+			# If we are on multi-GPU, split add a dimension
+			if len(start_positions.size()) > 1:
+				start_positions = start_positions.squeeze(-1).to(start_logits.device)
+			if len(end_positions.size()) > 1:
+				end_positions = end_positions.squeeze(-1).to(end_logits.device)
+			# sometimes the start/end positions are outside our model inputs, we ignore these terms
+			ignored_index = start_logits.size(1)
+			start_positions = start_positions.clamp(0, ignored_index)
+			end_positions = end_positions.clamp(0, ignored_index)
+
+			loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
+			start_loss = loss_fct(start_logits, start_positions)
+			end_loss = loss_fct(end_logits, end_positions)
+			total_loss = (start_loss + end_loss) / 2
+
+		if not return_dict:
+			output = (start_logits, end_logits) + outputs[2:]
+			return ((total_loss,) + output) if total_loss is not None else output
+
+		return QuestionAnsweringModelOutput(
+			loss=total_loss,
+			start_logits=start_logits,
+			end_logits=end_logits,
+			hidden_states=outputs.hidden_states,
+			attentions=outputs.attentions,
+		)

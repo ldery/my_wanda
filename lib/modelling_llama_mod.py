@@ -254,9 +254,15 @@ class LlamaAttention(nn.Module):
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Resettinig ")
 					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+		elif self.prune_method == "fluct":
+			ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+			ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).pow_(2).mean(dim=0, keepdim=True)
+			ins_ = (self.o_proj.weight.data.abs().to(torch.float32).pow_(2).mean(dim=0, keepdim=True)) * ins_
+			self.intermed_cache = ins_.view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
 		elif self.prune_method == "random":
 			self.intermed_cache = torch.rand((1, 1, self.num_heads, 1)).to(attn_output.device)
-
+		else:
+			self.intermed_cache = torch.zeros((1, 1, self.num_heads, 1)).to(attn_output.device)
 
 		if self.computing_updated_bias is not None:
 			shape = attn_output.shape[-2:]
@@ -304,7 +310,7 @@ class LlamaMLP(nn.Module):
 			return torch.zeros_like(x)
 
 		intermed_result = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-		# TODO [ldery] -- work on a better normalization factor (might be more necessary for Mistral model)
+
 		if self.is_using_main and (self.main_mask is not None):
 			intermed_result = intermed_result * self.main_mask
 		elif (self.temp_mask is not None):
@@ -322,8 +328,15 @@ class LlamaMLP(nn.Module):
 				if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
 					print("We hit a nan or inf. Stopping")
 					self.intermed_cache = torch.zeros_like(self.intermed_cache)
+			elif self.prune_method == "fluct":
+				ins_ = intermed_result.view(-1, last_dim)
+				ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).to(torch.float32).pow_(2).mean(dim=0, keepdim=True)
+				ins_ = (self.down_proj.weight.data.abs().to(torch.float32).pow_(2).mean(dim=0, keepdim=True)) * ins_
+				self.intermed_cache = ins_.view(1, 1, -1)
 			elif self.prune_method == "random":
 				self.intermed_cache = torch.rand((1, 1, self.intermediate_size)).to(x.device)
+			else:
+				self.intermed_cache = torch.zeros((1, 1, self.intermediate_size)).to(x.device)
 
 			if self.computing_updated_bias is not None:
 				self.intermed_cache = intermed_result.view(-1, last_dim).mean(axis=0, keepdims=True) * (self.computing_updated_bias).squeeze(0)

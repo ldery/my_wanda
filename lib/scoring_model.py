@@ -36,12 +36,12 @@ def split_train_test(run_info, normalization, num_folds=5, sid=0, no_split=False
 		trn_list = set(range(len(ys))) - tst_list
 
 	tr_xs, tr_ys = [xs[i] / normalization for i in trn_list], [ys[i] for i in trn_list]
-	tr_ys  = torch.tensor(tr_ys).float().cuda()
+	tr_ys  = torch.tensor(tr_ys).float()
 	mean_ys = tr_ys.mean().item()
 	tr_ys -= mean_ys
 
 	ts_xs, ts_ys = [xs[i] / normalization for i in tst_list], [ys[i] for i in tst_list]
-	ts_ys  = torch.tensor(ts_ys).float().cuda()
+	ts_ys  = torch.tensor(ts_ys).float()
 	ts_ys -= mean_ys
 
 	return  (tr_xs, tr_ys), (ts_xs, ts_ys)
@@ -162,7 +162,7 @@ class LinearModel(nn.Module):
 
 		# Initialize to the base mask
 		with torch.no_grad():
-			self.score_tensor.add_(base_mask)
+			self.score_tensor.add_(base_mask.cuda())
 
 	def set_reg_weight(self, reg_weight):
 		self.reg_weight = reg_weight
@@ -260,7 +260,7 @@ class ScoreModel(nn.Module):
 			start_, end_ = int(self.hp_dict['bsz'] * batch_id), int(self.hp_dict['bsz'] * (batch_id + 1))
 			xs_masks = torch.stack([xs[i_] for i_ in perm[start_:end_]]).float().cuda()
 
-			this_ys = ys[perm[start_:end_]].view(-1, 1)
+			this_ys = (ys[perm[start_:end_]].view(-1, 1)).cuda()
 			# do the forward pass heres
 			preds = self.forward(xs_masks)
 

@@ -185,7 +185,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 			xs = score_perfs[0][id_]
 		else:
 			xs = [torch.cat((xs[k], score_perfs[0][id_][k])) for k in range(len(xs))]
-	xs = [k.cuda() for k in xs]
+
 	ys = score_perfs[1][id_]
 
 	is_valid = np.array(ys) < INF
@@ -469,7 +469,7 @@ def get_linearmodel_hpdict(args):
 		'reg_type': [args.sm_reg_type],
 		'bsz' : eval(args.sm_bsz),
 		'nepochs' : [args.sm_nepochs],
-		'patience': [10],
+		'patience': [20],
 	}
 	return base_hp
 
@@ -638,7 +638,7 @@ def main():
 
 
 	parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
-	parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
+	parser.add_argument('--sm_nepochs', type=int, default=100, help='number of epochs to use to fit the linear model')
 	parser.add_argument('--last-epoch', type=int, default=-1)
 	parser.add_argument('--repair_method', type=str, default='bias', choices=["none", "bias"])
 

@@ -377,7 +377,7 @@ class MistralAttention(nn.Module):
         # else:
         #     self.intermed_cache = torch.zeros((1, 1, self.num_heads, 1)).to(attn_output.device)
 
-        if self.computing_updated_bias is not None: ## bug here. Reshape is wrong; need to fix to reflect gkattention shape
+        if self.computing_updated_bias is not None:
             shape = attn_output.shape[-2:]
             
             self.intermed_cache = attn_output.reshape(-1, shape[0], shape[1]).mean(axis=0, keepdims=True).unsqueeze(0)
@@ -396,7 +396,7 @@ class MistralAttention(nn.Module):
 
 
 class MistralDecoderLayer(nn.Module):
-    def __init__(self, config: MistralConfig, layer_id: -1):
+    def __init__(self, config: MistralConfig, layer_id:int = -1):
         super().__init__()
         self.hidden_size=config.hidden_size
 

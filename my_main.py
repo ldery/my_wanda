@@ -678,7 +678,7 @@ def main():
 
     if args.repair_method == 'bias':
         post_pruning_bias_fix(model, bias_info)
-        model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
+        # model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
         ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
         model.seqlen = args.prune_seqlen # reset the seqlen for pruning
         print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))

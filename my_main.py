@@ -33,9 +33,12 @@ INF = 1e8
 
 def set_masks(module_map, all_masks, module_index_info, global_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
 	# Sample from the global distribution here!
-	init_set = np.ones_like(global_proba)
-	num_to_zero = int(pfrac * np.sum(init_set)) + 1
-	chosen_idxs = np.random.choice(np.arange(len(global_proba)), size=num_to_zero, p=global_proba, replace=False)
+	init_set = np.ones_like(global_proba["probas"])
+	# slightly over sample
+	num_to_zero = int(1.5 * pfrac * np.sum(init_set)) + 1
+	chosen_idxs = np.random.choice(np.arange(len(global_proba["probas"])), size=num_to_zero, p=global_proba["probas"], replace=False)
+	cutoff_idx = (np.cumsum(global_proba['param_counts'][chosen_idxs]) < global_proba["n_params_to_drop"]).sum()
+	chosen_idxs = chosen_idxs[:(cutoff_idx + 1)]
 	init_set[chosen_idxs] = 0
 
 	init_set_start = 0
@@ -183,7 +186,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 	for idx, truth_val in enumerate(is_valid):
 		if truth_val:
 			this_masks.append(xs[idx])
-			this_scores.append(ys[idx]) # TODO (LDERY) -- double check if this is better in the long run. Initial experiments said no -np.log(-ys[idx]))
+			this_scores.append(ys[idx]) # TODO (LDERY) -- double check if this is better in the long run. Initial experiments said no 
 	xs, ys = this_masks, this_scores
 	print('Total runs = {}, Total dropped = {}'.format(len(is_valid), len(is_valid) - sum(is_valid)))
 
@@ -328,16 +331,19 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 
 	# Do a global sampling here
 	## Aggregate all the sampling probabilities
-	global_proba = []
+	global_proba = {'probas': [], 'param_counts': [], 'n_params_to_drop': args.prune_frac * get_param_count(model)}
 	for k, v in all_sampling_proba.items():
 		sampling_proba, _, use_indices = v
-		global_proba.append(sampling_proba[use_indices])
-	global_proba = np.concatenate(global_proba)
+		global_proba['probas'].append(sampling_proba[use_indices])
+		p_count =  model.model.params_per_pruned_hidden if 'mlp' in k else model.model.params_per_pruned_head
+		global_proba['param_counts'].append([p_count for _ in range(len(use_indices))])
+	global_proba['probas'] = np.concatenate(global_proba['probas'])
+	global_proba['param_counts'] = np.concatenate(global_proba['param_counts'])
 
 	if not args.no_perturb: # We are not running a perturbation algorithm
-		global_proba = global_proba.max() - global_proba # Make positive
+		global_proba['probas'] = global_proba['probas'].max() - global_proba['probas'] # Make positive
 		# This will be the full distribution amongst all entities.
-		global_proba /= np.sum(global_proba)
+		global_proba['probas'] /= np.sum(global_proba['probas'])
 
 		# Clear the info-cache for the next round !
 		for k, v in info_cache.items():
@@ -368,10 +374,9 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 	preset_qt = None
 	if args.sm_lin_model_type == 'global' and (args.sm_nepochs > 0): # and (not args.no_perturb):
 		if args.no_perturb:
-			best_fit = global_proba
+			best_fit = global_proba['probas']
 		else:
 			best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
-# 		pdb.set_trace()
 
 		init_param_counts = np.zeros_like(best_fit)
 		start_idx = 0

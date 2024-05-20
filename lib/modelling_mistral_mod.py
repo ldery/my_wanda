@@ -354,19 +354,17 @@ class MistralAttention(nn.Module):
             attn_output = attn_output * repeat_kv(self.temp_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
 
         if self.prune_method == "magnitude":
-            with torch.no_grad():
-                self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_key_value_heads, self.num_key_value_groups).transpose(1, 2).reshape(-1, self.num_key_value_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_key_value_heads, 1)
+            self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_key_value_heads, self.num_key_value_groups).transpose(1, 2).reshape(-1, self.num_key_value_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_key_value_heads, 1)
         elif self.prune_method == "wanda":
-            with torch.no_grad():
-                if self.ins_ is None:
-                    self.ins_ = self.o_proj.weight.data.to(torch.float32).abs()
-                ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
-                ins_ = self.ins_ * ins_.pow(2).mean(0, keepdim=True).sqrt()
-                self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_key_value_heads, -1).mean(axis=-1, keepdim=True)
+            if self.ins_ is None:
+                self.ins_ = self.o_proj.weight.data.to(torch.float32).abs()
+            ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
+            ins_ = self.ins_ * ins_.pow(2).mean(0, keepdim=True).sqrt()
+            self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_key_value_heads, -1).mean(axis=-1, keepdim=True)
 
-                if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
-                    print("We hit a nan or inf. Resettinig ")
-                    self.intermed_cache = torch.zeros_like(self.intermed_cache)
+            if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
+                print("We hit a nan or inf. Resettinig ")
+                self.intermed_cache = torch.zeros_like(self.intermed_cache)
         # elif self.prune_method == "fluct":
         #     ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
         #     ins_ = (ins_ - ins_.mean(dim=0, keepdim=True)).pow_(2).mean(dim=0, keepdim=True)
@@ -613,13 +611,30 @@ class MistralModel(MistralPreTrainedModel):
         self._attn_implementation=config._attn_implementation
         self.norm=MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # self.hidden_size = config.hidden_size
+        # self.num_heads = config.num_attention_heads
+        # self.num_key_value_heads = config.num_key_value_heads
+        # self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        # self.head_dim = self.hidden_size // self.num_heads
+        # self.max_position_embeddings = config.max_position_embeddings
+
+        # if (self.head_dim * self.num_heads) != self.hidden_size:
+        #     raise ValueError(
+        #         f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
+        #         f" and `num_heads`: {self.num_heads})."
+        #     )
+        # self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        # self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
         # Do some setup to compute size of important units here
-        self.params_per_pruned_hidden=config.hidden_size * \
-            3  # [gate_proj, up_proj, down_projs]
+        self.params_per_pruned_hidden=config.hidden_size * 3  # [gate_proj, up_proj, down_projs]
 
         head_dim=config.hidden_size // config.num_attention_heads
         # (num parameters per-head) * [3 (kqv) + 1(o)]
-        self.params_per_pruned_head=(head_dim * config.hidden_size) * 2.5
+        num_kv_groups = (config.num_attention_heads / config.num_key_value_heads)
+        self.params_per_pruned_head= (config.hidden_size * head_dim * 2)  + (config.hidden_size * head_dim * num_kv_groups * 2) 
 
         self.gradient_checkpointing=False
         # Initialize weights and apply final processing

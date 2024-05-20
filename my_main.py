@@ -22,6 +22,7 @@ import wandb
 from transformers.pytorch_utils import  find_pruneable_heads_and_indices, prune_linear_layer
 import gc
 import random
+from pprint import pprint
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -30,32 +31,39 @@ print('# of gpus: ', torch.cuda.device_count())
 
 INF = 1e8
 
-def set_masks(module_map, all_masks, all_sampling_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
+def set_masks(module_map, all_masks, module_index_info, global_proba, pfrac=0.1, mlp_attn_ratio=1.0, use_complement=False):
+    # Sample from the global distribution here!
+    init_set = np.ones_like(global_proba["probas"])
+    # slightly over sample
+    num_to_zero = int(1.5 * pfrac * np.sum(init_set)) + 1
+    chosen_idxs = np.random.choice(np.arange(len(global_proba["probas"])), size=num_to_zero, p=global_proba["probas"], replace=False)
+    cutoff_idx = (np.cumsum(global_proba['param_counts'][chosen_idxs]) < global_proba["n_params_to_drop"]).sum()
+    chosen_idxs = chosen_idxs[:(cutoff_idx + 1)]
+    init_set[chosen_idxs] = 0
+
+    init_set_start = 0
     for k, (name, module) in module_map.items():
         this_pfrac = pfrac
         if name.endswith('self_attn'):
             this_pfrac = pfrac * mlp_attn_ratio
 
         module.is_using_main = False
-        sampling_proba, fixed_indices, use_indices = all_sampling_proba[k]
+        _, fixed_indices, use_indices = module_index_info[k]
         if use_complement:
             module.temp_mask = 1 - module.temp_mask
             module.temp_mask[:, :, fixed_indices] = 1.0
             all_masks[k].append(module.temp_mask.cpu().squeeze()[use_indices])
         else:
-            mask = get_random_mask(module.main_mask.numel(), module.main_mask, sampling_proba, this_pfrac)
-            module.temp_mask = torch.Tensor(mask).type(module.main_mask.type())
-            all_masks[k].append(torch.Tensor(mask).squeeze()[use_indices])
+            init_set_end = init_set_start + len(use_indices)
+            sampled_mask = init_set[init_set_start: init_set_end]
+            init_set_start = init_set_end
+            mask = torch.ones_like(module.main_mask)
+            mask[:, :, use_indices] = torch.tensor(sampled_mask).type(module.main_mask.type()).view(*(mask[:, :, use_indices]).shape)
+            module.temp_mask = mask
+            all_masks[k].append(torch.Tensor(sampled_mask))
 
-def get_random_mask(intermediate_sz, main_mask, sampling_proba, pfrac):
-    init_set = np.ones((1, 1, intermediate_sz)) if main_mask is None else main_mask.cpu().numpy()
-    num_to_zero = int(pfrac * np.sum(init_set)) + 1
-    non_zero_idxs = np.squeeze(init_set).nonzero()[0]
-    new_proba = sampling_proba[non_zero_idxs]
-    new_proba = new_proba / np.sum(new_proba)
-    chosen_idxs = np.random.choice(non_zero_idxs, size=num_to_zero, p=new_proba, replace=False)
-    init_set[:, :, chosen_idxs] = 0
-    return init_set
+    if not use_complement:
+        assert init_set_end == len(init_set)
 
 def get_train_ppl_multitry(model, trainloader, this_bsz):
     continue_ = True
@@ -76,7 +84,7 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
 
     return this_ppl, this_bsz
 
-def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
+def get_random_mask_scores(model, dataset, module_map, module_index_info, global_proba, use_complement=True, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
 
     # set to use main
     for k, (name, module) in module_map.items():
@@ -84,11 +92,12 @@ def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=1
 
     all_masks, all_perfs = defaultdict(list), defaultdict(list)
     seed_ = random.randint(0, 1e4)
-    for iter_ in range(mpi // 2):
+    niters = mpi // 2 if use_complement else mpi
+    for iter_ in range(niters):
         this_bsz = bsz
 
         # set the layer mask here
-        set_masks(module_map, all_masks, all_sampling_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
+        set_masks(module_map, all_masks, module_index_info, global_proba, pfrac=pfrac, mlp_attn_ratio=mlp_attn_ratio)
         this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
 
         print('[v1]Iter : ', iter_, ' PPL = ', this_ppl)
@@ -98,19 +107,20 @@ def get_random_mask_scores(model, dataset, module_map, all_sampling_proba, bsz=1
             # NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
             all_perfs[k].append(-this_ppl)
 
-        # set the complement mask here
-        set_masks(
-            module_map, all_masks, all_sampling_proba, pfrac=pfrac,
-            mlp_attn_ratio=mlp_attn_ratio, use_complement=True
-        )
-        this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
+        if use_complement:
+            # set the complement mask here
+            set_masks(
+                module_map, all_masks, module_index_info, global_proba, pfrac=pfrac,
+                mlp_attn_ratio=mlp_attn_ratio, use_complement=True
+            )
+            this_ppl, this_bsz = get_train_ppl_multitry(model, dataset, this_bsz)
 
-        print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
-        this_ppl = this_ppl if this_ppl < INF else INF
+            print('[v2]Iter : ', iter_, ' PPL = ', this_ppl)
+            this_ppl = this_ppl if this_ppl < INF else INF
 
-        for k, (name, module) in module_map.items():
-            # NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
-            all_perfs[k].append(-this_ppl)
+            for k, (name, module) in module_map.items():
+                # NB : since we want the co-efficient to be more positive for more useful modules, we input -ppl
+                all_perfs[k].append(-this_ppl)
 
     # reset to use main
     for k, (name, module) in module_map.items():
@@ -137,15 +147,25 @@ def get_llm(model_name, cache_dir="llm_weights", prune_seqlen=1024):
 
 def hook_fn(module_name, info_cache):
     def hook(module, in_, out_):
-        flat_in = (module.intermed_cache).clone().detach().float()
-        module.intermed_cache = None
-        if 'in' not in info_cache[module_name]:
-            info_cache[module_name]['in'] = [1, flat_in]
+        if isinstance(module.intermed_cache, tuple):
+            flat_in = (module.intermed_cache[0]).clone().detach().float(), (module.intermed_cache[1]).clone().detach().float()
+            if 'in' not in info_cache[module_name]:
+                info_cache[module_name]['in'] = [1, flat_in]
+            else:
+                info_cache[module_name]['in'] = [
+                    info_cache[module_name]['in'][0] + 1,
+                    (info_cache[module_name]['in'][1][0].add_(flat_in[0]), info_cache[module_name]['in'][1][1].add_(flat_in[1]))
+                ]
         else:
-            info_cache[module_name]['in'] = [
-                info_cache[module_name]['in'][0] + 1,  
-                info_cache[module_name]['in'][1].add_(flat_in)
-            ]
+            flat_in = (module.intermed_cache).clone().detach().float()
+            if 'in' not in info_cache[module_name]:
+                info_cache[module_name]['in'] = [1, flat_in]
+            else:
+                info_cache[module_name]['in'] = [
+                    info_cache[module_name]['in'][0] + 1,
+                    info_cache[module_name]['in'][1].add_(flat_in)
+                ]
+        module.intermed_cache = None
     return hook
 
 def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, all_sampling_proba, parent_id='.',  model_type='local'):
@@ -166,7 +186,7 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
     for idx, truth_val in enumerate(is_valid):
         if truth_val:
             this_masks.append(xs[idx])
-            this_scores.append(-np.log(-ys[idx]))
+            this_scores.append(ys[idx]) # TODO (LDERY) -- double check if this is better in the long run. Initial experiments said no 
     xs, ys = this_masks, this_scores
     print('Total runs = {}, Total dropped = {}'.format(len(is_valid), len(is_valid) - sum(is_valid)))
 
@@ -180,32 +200,47 @@ def get_score_models(score_perfs, module_map, info_cache, hp_dict, wandb_run, al
 
     return score_map
 
-def run_data_to_sampling_proba(info, module, pfrac):
-    avg_act_magnitudes = info['in'][1] / info['in'][0]
+def updated_run_data_to_sampling_proba(info, module, pfrac):
+    if isinstance(info['in'][1], tuple):
+        ins_mean, ins_sq = info['in'][1][0] / info['in'][0], info['in'][1][1] / info['in'][0]
+        avg_act_magnitudes = (ins_sq - ins_mean**2)
+        if hasattr(module, 'num_key_value_heads'):
+            avg_act_magnitudes = avg_act_magnitudes.view(1, 1, module.num_heads, -1).mean(axis=-1, keepdim=True)
+    else:
+        avg_act_magnitudes = info['in'][1] / info['in'][0]
     sampling_proba = avg_act_magnitudes.cpu().squeeze().numpy()
+    sampling_proba = (sampling_proba - np.mean(sampling_proba)) / np.std(sampling_proba)
 
-    num_keep_static = 0 if pfrac is None else int(len(sampling_proba)*(1.0 - 2*pfrac)) # hard coded to look at 2x the original pruning fraction
+    # hard coded to look at 2x the original pruning fraction
+    num_keep_static = 0 if pfrac is None else int(len(sampling_proba)*(1.0 - 2*pfrac))
     sorted_ = np.argsort(-sampling_proba)
     fixed_indices, use_indices = sorted_[:num_keep_static], sorted_[num_keep_static:]
 
-    sampling_proba = sampling_proba.max() - sampling_proba
-    sampling_proba[fixed_indices] = 0
+    assert module.main_mask is None, "the main masks of all modules should be none by this point."
 
-    if module.main_mask is not None:
-        sampling_proba *= (module.main_mask).cpu().float().squeeze().numpy()
-    sampling_proba /= np.sum(sampling_proba)
-    
-    if np.isnan(sampling_proba).any():
-        print('We got nan in the sampling probability')
-        # pdb.set_trace()
-
-    assert not np.isnan(sampling_proba).any(), 'Nans encountered in the sampling probability distribution'
     return sampling_proba, fixed_indices, use_indices
 
 def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior, tokenizer, epoch_=1):
     
     def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
         score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
+        if regression_weights is None:
+            regression_weights = (info['in'][1] / info['in'][0]).squeeze()
+            regression_weights = regression_weights[use_indices]
+
+    def update_mask_one_layer(module, info, score_info, prune_frac, regression_weights, fixed_indices, use_indices, preset_qt=None):
+        #  Error is somewhere around this function. 
+        if isinstance(info['in'][1], tuple):
+            if hasattr(module, 'num_key_value_heads'):
+                shape_template =(1, 1, module.num_heads, 1)
+                score_model_weights = torch.zeros((module.num_heads, )).squeeze().cuda()
+            else:
+                score_model_weights = torch.zeros_like(info['in'][1][0]).squeeze()
+                shape_template = info['in'][1][0].shape
+        else:
+            score_model_weights = torch.zeros_like(info['in'][1]).squeeze()
+            shape_template = info['in'][1].shape
+
         if regression_weights is None:
             regression_weights = (info['in'][1] / info['in'][0]).squeeze()
             regression_weights = regression_weights[use_indices]
@@ -248,7 +283,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
         # Clear the info-cache for the next round !
         for k, v in info_cache.items():
             info_cache[k] = dict()
-
+   
     def compute_updated_masks_global(prune_frac, score_matrix, score_model_map, all_sampling_proba, mlp_attn_ratio=1.0,):
         start_idx = 0
         for id_, (name, module) in module_map.items():
@@ -277,6 +312,7 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 
     # Initial setup to get the initial probability distribution for sampling
     get_train_ppl_multitry(model, data_for_prior, args.bsz)
+    print('Done generating prior')
 
     hp_dict = get_linearmodel_hpdict(args)
     score_matrix = defaultdict(lambda: None)
@@ -286,22 +322,48 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
         if name.endswith('self_attn'):
             this_pfrac = this_pfrac * args.mlp_attn_ratio
         this_pfrac = None if args.no_perturb else this_pfrac
-        all_sampling_proba[id_] = run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
-        module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
+        all_sampling_proba[id_] = updated_run_data_to_sampling_proba(info_cache[name], module, this_pfrac)
+        if isinstance(info_cache[name]['in'][1], tuple):
+            module.main_mask = torch.ones_like(info_cache[name]['in'][1][0]).half()
+            if hasattr(module, 'num_key_value_heads'):
+                module.main_mask = module.main_mask.view(1, 1, module.num_heads, -1).mean(axis=-1, keepdim=True)
+            else:
+                module.main_mask = module.main_mask.view(1, 1, module.main_mask.shape[-1])
+        else:
+            module.main_mask = torch.ones_like(info_cache[name]['in'][1]).half()
         module.prune_method = None # we are turning off gathering any pruning statistics
 
     for handle in hook_handles:
         handle.remove()
 
+    # Do a global sampling here
+    ## Aggregate all the sampling probabilities
+    global_proba = {'probas': [], 'param_counts': [], 'n_params_to_drop': args.prune_frac * get_param_count(model)}
+    for k, v in all_sampling_proba.items():
+        sampling_proba, _, use_indices = v
+        global_proba['probas'].append(sampling_proba[use_indices])
+        p_count =  model.model.params_per_pruned_hidden if 'mlp' in k else model.model.params_per_pruned_head
+        global_proba['param_counts'].append([p_count for _ in range(len(use_indices))])
+    global_proba['probas'] = np.concatenate(global_proba['probas'])
+    global_proba['param_counts'] = np.concatenate(global_proba['param_counts'])
+
     if not args.no_perturb: # We are not running a perturbation algorithm
+        global_proba['probas'] = global_proba['probas'].max() - global_proba['probas'] # Make positive
+        # This will be the full distribution amongst all entities.
+        global_proba['probas'] /= np.sum(global_proba['probas'])
+
         # Clear the info-cache for the next round !
         for k, v in info_cache.items():
-            info_cache[k]['in'][1].zero_()
-            
+            if isinstance(info_cache[k]['in'][1], tuple):
+                info_cache[k]['in'][1][0].zero_()
+                info_cache[k]['in'][1][1].zero_()
+            else:
+                info_cache[k]['in'][1].zero_()
+
         start = time()
         score_info = get_random_mask_scores(
-                            model, dataset, module_map, all_sampling_proba,
-                            bsz=args.bsz, nsamples=args.nsamples,
+                            model, dataset, module_map, all_sampling_proba, global_proba,
+                            bsz=args.bsz, nsamples=args.nsamples, use_complement=args.use_complement,
                             mpi=args.masks_per_iter, pfrac=args.prune_frac, mlp_attn_ratio=args.mlp_attn_ratio
         )
         gen_scores_time = time() - start
@@ -314,14 +376,23 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
         score_model_maps = None
         score_matrix = None
 
+
     # Need to do some fitting to a linear model here.
     preset_qt = None
-    if args.sm_lin_model_type == 'global' and (args.sm_nepochs > 0) and (not args.no_perturb):
-        best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
+    if args.sm_lin_model_type == 'global' and (args.sm_nepochs > 0): # and (not args.no_perturb):
+        if args.no_perturb:
+            best_fit = global_proba['probas']
+        else:
+            best_fit = score_model_maps[args.sm_lin_model_type].cpu().numpy()
+        
         init_param_counts = np.zeros_like(best_fit)
         start_idx = 0
         for id_, (name, module) in module_map.items():
-            num_entries =  len(score_info[0][id_][0])
+            if args.no_perturb:
+                num_entries= len(all_sampling_proba[id_][-1])
+            else:
+                num_entries =  len(score_info[0][id_][0])
+
             if name.endswith('mlp'):
                 init_param_counts[start_idx: (start_idx + num_entries)] = model.model.params_per_pruned_hidden
             else:
@@ -332,17 +403,20 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
         cum_sum_param_counts = np.cumsum(init_param_counts[sort_idxs])
         threshold = int(model.original_param_count * args.prune_frac)
         keep_idxs = (cum_sum_param_counts > threshold) * 1.0
-        best_fit = torch.tensor(keep_idxs[np.argsort(sort_idxs)], device=score_model_maps[args.sm_lin_model_type].device).float()
+        best_fit = torch.tensor(keep_idxs[np.argsort(sort_idxs)]).float().cuda()
         # We need to do some prep here
         start_idx = 0
-        del score_model_maps[args.sm_lin_model_type]
+        score_model_maps = {}
         for id_, (name, module) in module_map.items():
-            num_entries =  len(score_info[0][id_][0])
+            if args.no_perturb:
+                num_entries= len(all_sampling_proba[id_][-1])
+            else:
+                num_entries =  len(score_info[0][id_][0])
+
             this_group = best_fit[start_idx: (start_idx + num_entries)]
             score_model_maps[id_] = this_group
             start_idx += num_entries
         preset_qt = 0
-
 
     compute_updated_masks_local(args.prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=args.mlp_attn_ratio, preset_qt=preset_qt, no_regression=(args.sm_nepochs == 0))
     if wandb_run is not None:
@@ -371,7 +445,8 @@ def args_to_dict(args):
         'Lin.type': args.sm_lin_model_type,
         'name': args.wandb_project_name,
         'bias_ns': args.bias_ns,
-        'prion_ns': args.prior_ns
+        'prion_ns': args.prior_ns,
+        'complement': args.use_complement
     }
 
 def args_to_str(args):
@@ -523,11 +598,13 @@ def prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_i
 def post_pruning_bias_fix(model, bias_info):
     for name, module in model.named_modules():
         if name.endswith('self_attn'):
-            device = module.o_proj.weight.device
-            module.o_proj.bias = torch.nn.Parameter((bias_info[name]).half().to(device))
+            if module.o_proj is not None:
+                device = module.o_proj.weight.device
+                module.o_proj.bias = torch.nn.Parameter((bias_info[name]).half().to(device))
         elif name.endswith('mlp'):
-            device = module.down_proj.weight.device
-            module.down_proj.bias = torch.nn.Parameter((bias_info[name]).half().to(device))
+            if module.down_proj is not None:
+                device = module.down_proj.weight.device
+                module.down_proj.bias = torch.nn.Parameter((bias_info[name]).half().to(device))
 
 
 def main():
@@ -541,7 +618,9 @@ def main():
     parser.add_argument('--bsz', type=int, default=14, help='Instantaneous batch size for forward pass')
     parser.add_argument('--mlp_attn_ratio', type=float, default=1.0, help="For a given prune_frac, the ratio of the pruning for attn vrs mlp")
 
-    parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random", "fluct"])
+    parser.add_argument('--use_complement', action="store_true", help="Whether to use complement")
+
+    parser.add_argument('--prune_method', type=str, default="magnitude", choices=["magnitude", "wanda", "random", "fluct", "fluct.2.0"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
@@ -592,12 +671,13 @@ def main():
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=('olmo' in args.model.lower()))
 
+    print("We are going to load the dataset: ", model.seqlen)
     # model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
     # Get the test loader
     trainloader, testloader = get_loaders(
         args.dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
     )
-
+    print('We finished loading the dataset')
     start_time = time()
     orig_train_ppl, orig_test_ppl = -1, -1 #eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
     model.seqlen = args.prune_seqlen
@@ -626,7 +706,7 @@ def main():
     original_param_count = get_param_count(model)
     model.original_param_count = original_param_count
     cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
-    epoch_ = 1
+    epoch_, prune_runtimes = 1, []
     while True:
         if (abs(cur_sparsity - args.sparsity_ratio) < args.tol) or (cur_sparsity > args.sparsity_ratio):
             break
@@ -648,7 +728,9 @@ def main():
         else:
             this_data = full_dataset[(args.nsamples * (epoch_ - 1)):(args.nsamples * epoch_)]
             this_prior = prior_dataset[(args.prior_ns * (epoch_ - 1)):(args.prior_ns * epoch_)]
+            start_ = time()
             mask_info = investigate_score_based_mask(args, model, wandb_run, this_data, this_prior, tokenizer, epoch_=epoch_)
+            prune_runtimes.append(time() - start_)
             # Save the mask info for the epoch
             with open(save_loc, 'wb') as handle:
                 pkl.dump(mask_info, handle)
@@ -656,7 +738,7 @@ def main():
         print('Prune model')
         prune_model(args, model, mask_info, tokenizer, bias_calibration_data, bias_info, epoch=epoch_)
         cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
-        print(model)
+        pprint({k: v.shape for k, v in model.named_parameters() if ('o_proj' in k) or ('down_proj' in k)})
 
         start_time = time()
         # model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
@@ -676,10 +758,11 @@ def main():
         if epoch_ == args.last_epoch:
             break
 
+    print('Pruning took {:.3f} min on average'.format(np.mean(prune_runtimes) / 60.0))
     if args.repair_method == 'bias':
         post_pruning_bias_fix(model, bias_info)
         # model.seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen for evaluation
-        ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
+        ppl_train, ppl_test = eval_ppl(model, trainloader, testloader, model.device, bsz=4)
         model.seqlen = args.prune_seqlen # reset the seqlen for pruning
         print('Post-Bias-Fix-Train PPL = {:.3f} | Post-Bias-Fix-Test PPL = {:.3f}'.format(ppl_train, ppl_test))
         if wandb_run is not None:

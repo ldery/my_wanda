@@ -8,3 +8,4 @@ llm_weights/
 out/*
 *.sh
 wandb/
+pruning_no_backward/

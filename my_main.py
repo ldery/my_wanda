@@ -669,6 +669,7 @@ def main():
     if args.prune_seqlen < 0:
         args.prune_seqlen = model.config.max_position_embeddings # set seqlen to the model seqlen
     model.eval()
+    print(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=('olmo' in args.model.lower()))
 
     print("We are going to load the dataset: ", model.seqlen)
@@ -679,7 +680,7 @@ def main():
     )
     print('We finished loading the dataset')
     start_time = time()
-    orig_train_ppl, orig_test_ppl = -1, -1 #eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
+    orig_train_ppl, orig_test_ppl =  eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
     model.seqlen = args.prune_seqlen
     original_runtime = time() - start_time
     print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))

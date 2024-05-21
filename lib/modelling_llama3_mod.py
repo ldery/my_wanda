@@ -54,6 +54,7 @@ from transformers.models.llama import LlamaConfig
 
 
 if is_flash_attn_2_available():
+    print('Flash attention is available so using')
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
@@ -435,8 +436,8 @@ class LlamaAttention(nn.Module):
         if self.is_using_main and (self.main_mask is not None):
             attn_output = attn_output * repeat_kv(self.main_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
         elif (self.temp_mask is not None):
-            # import pdb
-            # pdb.set_trace()
+            import pdb
+            pdb.set_trace()
             attn_output = attn_output * repeat_kv(self.temp_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
 
         if self.prune_method == "magnitude":
@@ -444,8 +445,7 @@ class LlamaAttention(nn.Module):
         elif self.prune_method == "wanda":
             ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
             ins_ = (self.o_proj.weight.data.abs().to(torch.float32)) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
-            self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
-
+            self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_key_value_heads, -1).mean(axis=-1, keepdim=True)
             if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
                 print("We hit a nan or inf. Resettinig ")
                 self.intermed_cache = torch.zeros_like(self.intermed_cache)
@@ -833,7 +833,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)

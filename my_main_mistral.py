@@ -9,7 +9,6 @@ from time import time
 import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
-from lib.modelling_llama3_mod import LlamaForCausalLM, repeat_kv
 from lib.modelling_mistral_mod import MistralForCausalLM, repeat_kv
 from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
@@ -58,7 +57,10 @@ def set_masks(module_map, all_masks, module_index_info, global_proba, pfrac=0.1,
             sampled_mask = init_set[init_set_start: init_set_end]
             init_set_start = init_set_end
             mask = torch.ones_like(module.main_mask)
-            mask[:, :, use_indices] = torch.tensor(sampled_mask).type(module.main_mask.type()).view(*(mask[:, :, use_indices]).shape)
+            try:
+                mask[:, :, use_indices] = torch.tensor(sampled_mask).type(module.main_mask.type()).view(*(mask[:, :, use_indices]).shape)
+            except:
+                pdb.set_trace()
             module.temp_mask = mask
             all_masks[k].append(torch.Tensor(sampled_mask))
 
@@ -69,19 +71,19 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
     continue_ = True
     while continue_:
         with torch.no_grad():
-            this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
-            # try:
-            #     this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
-            #     continue_ = False
-            # except Exception as e:
-            #     if 'memory' in str(e):
-            #         print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
-            #         gc.collect()
-            #         torch.cuda.empty_cache()
-            #         this_bsz = max(1, this_bsz // 2)
-            #     else:
-            #         print(e)
-            #         exit()
+            # this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+            try:
+                this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+                continue_ = False
+            except Exception as e:
+                if 'memory' in str(e):
+                    print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    this_bsz = max(1, this_bsz // 2)
+                else:
+                    print(e)
+                    exit()
         break
     return this_ppl, this_bsz
 
@@ -206,7 +208,7 @@ def updated_run_data_to_sampling_proba(info, module, pfrac):
         ins_mean, ins_sq = info['in'][1][0] / info['in'][0], info['in'][1][1] / info['in'][0]
         avg_act_magnitudes = (ins_sq - ins_mean**2)
         if hasattr(module, 'num_key_value_heads'):
-            avg_act_magnitudes = avg_act_magnitudes.view(1, 1, module.num_heads, -1).mean(axis=-1, keepdim=True)
+            avg_act_magnitudes = avg_act_magnitudes.view(1, 1, module.num_key_value_heads, -1).mean(axis=-1, keepdim=True)
     else:
         avg_act_magnitudes = info['in'][1] / info['in'][0]
     sampling_proba = avg_act_magnitudes.cpu().squeeze().numpy()
@@ -233,8 +235,8 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
         #  Error is somewhere around this function. 
         if isinstance(info['in'][1], tuple):
             if hasattr(module, 'num_key_value_heads'):
-                shape_template =(1, 1, module.num_heads, 1)
-                score_model_weights = torch.zeros((module.num_heads, )).squeeze().cuda()
+                shape_template =(1, 1, module.num_key_value_heads, 1)
+                score_model_weights = torch.zeros((module.num_key_value_heads, )).squeeze().cuda()
             else:
                 score_model_weights = torch.zeros_like(info['in'][1][0]).squeeze()
                 shape_template = info['in'][1][0].shape
@@ -260,9 +262,9 @@ def investigate_score_based_mask(args, model, wandb_run, dataset, data_for_prior
 
         mask_ = ((score_model_weights > qt)*1.0).half()
         if module.main_mask is not None:
-            module.main_mask *= (mask_).view(info['in'][1].shape)
+            module.main_mask *= (mask_).view(shape_template)
         else:
-            module.main_mask = (mask_).view(info['in'][1].shape)
+            module.main_mask = (mask_).view(shape_template)
         return module.main_mask.mean().item()
 
     def compute_updated_masks_local(prune_frac, score_matrix, score_model_maps, all_sampling_proba, mlp_attn_ratio=1.0, preset_qt=None, no_regression=False):

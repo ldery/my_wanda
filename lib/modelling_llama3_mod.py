@@ -435,6 +435,8 @@ class LlamaAttention(nn.Module):
         if self.is_using_main and (self.main_mask is not None):
             attn_output = attn_output * repeat_kv(self.main_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
         elif (self.temp_mask is not None):
+            import pdb
+            pdb.set_trace()
             attn_output = attn_output * repeat_kv(self.temp_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
 
         if self.prune_method == "magnitude":

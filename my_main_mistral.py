@@ -9,7 +9,7 @@ from time import time
 import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
-from lib.modelling_mistral_mod import MistralForCausalLM, repeat_kv
+from lib.latest_mistral_mod import MistralForCausalLM, repeat_kv
 from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly, eval_ppl_train

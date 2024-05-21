@@ -69,19 +69,18 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
     continue_ = True
     while continue_:
         with torch.no_grad():
-            this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
-            # try:
-            #     this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
-            #     continue_ = False
-            # except Exception as e:
-            #     if 'memory' in str(e):
-            #         print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
-            #         gc.collect()
-            #         torch.cuda.empty_cache()
-            #         this_bsz = max(1, this_bsz // 2)
-            #     else:
-            #         print(e)
-            #         exit()
+            try:
+                this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+                continue_ = False
+            except Exception as e:
+                if 'memory' in str(e):
+                    print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    this_bsz = max(1, this_bsz // 2)
+                else:
+                    print(e)
+                    exit()
     return this_ppl, this_bsz
 
 def get_random_mask_scores(model, dataset, module_map, module_index_info, global_proba, use_complement=True, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):

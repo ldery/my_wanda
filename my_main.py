@@ -69,18 +69,19 @@ def get_train_ppl_multitry(model, trainloader, this_bsz):
     continue_ = True
     while continue_:
         with torch.no_grad():
-            try:
-                this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
-                continue_ = False
-            except Exception as e:
-                if 'memory' in str(e):
-                    print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    this_bsz = max(1, this_bsz // 2)
-                else:
-                    print(e)
-                    exit()
+            this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+            # try:
+            #     this_ppl = eval_ppl_train(model, trainloader, bs=this_bsz, device=torch.device("cuda:0"))
+            #     continue_ = False
+            # except Exception as e:
+            #     if 'memory' in str(e):
+            #         print("Encountered a memory issue. Scaling bsz from {} to {}".format(this_bsz, max(1, this_bsz // 2)))
+            #         gc.collect()
+            #         torch.cuda.empty_cache()
+            #         this_bsz = max(1, this_bsz // 2)
+            #     else:
+            #         print(e)
+            #         exit()
     return this_ppl, this_bsz
 
 def get_random_mask_scores(model, dataset, module_map, module_index_info, global_proba, use_complement=True, bsz=12, nsamples=32, mpi=100, pfrac=0.1, mlp_attn_ratio=1.0):
@@ -679,7 +680,7 @@ def main():
     )
     print('We finished loading the dataset')
     start_time = time()
-    orig_train_ppl, orig_test_ppl =  eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
+    orig_train_ppl, orig_test_ppl = -1, -1 # eval_ppl(model, trainloader, testloader, model.device, bsz=args.bsz)
     model.seqlen = args.prune_seqlen
     original_runtime = time() - start_time
     print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(0.0, orig_train_ppl, orig_test_ppl))

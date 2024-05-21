@@ -9,8 +9,8 @@ from time import time
 import datetime
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 # from lib.modelling_llama import LlamaForCausalLM
-from lib.modelling_llama_mod import LlamaForCausalLM
-from lib.modelling_mistral_mod import MistralForCausalLM, repeat_kv
+from lib.modelling_llama3_mod import LlamaForCausalLM, repeat_kv
+from lib.modelling_mistral_mod import MistralForCausalLM
 from lib.data import get_loaders
 # from lib.my_prune import my_check_sparsity, my_method_prune
 from lib.eval import eval_ppl, eval_ppl_trainonly, eval_ppl_train
@@ -131,7 +131,7 @@ def get_random_mask_scores(model, dataset, module_map, module_index_info, global
 
 def get_llm(model_name, cache_dir="llm_weights", prune_seqlen=1024):
 
-    model = MistralForCausalLM.from_pretrained(
+    model = LlamaForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.float16,
         cache_dir=cache_dir,

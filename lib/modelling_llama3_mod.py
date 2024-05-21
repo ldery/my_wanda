@@ -50,7 +50,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 import pdb
-from .configuration_llama import LlamaConfig
+from transformers.models.llama import LlamaConfig
 
 
 if is_flash_attn_2_available():
@@ -777,16 +777,16 @@ class LlamaSdpaAttention(LlamaAttention):
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         if self.is_using_main and (self.main_mask is not None):
-            attn_output = attn_output * self.main_mask
+            attn_output = attn_output * repeat_kv(self.main_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
         elif (self.temp_mask is not None):
-            attn_output = attn_output * self.temp_mask
+            attn_output = attn_output * repeat_kv(self.temp_mask.transpose(1, 2), self.num_key_value_groups).transpose(1, 2)
 
         if self.prune_method == "magnitude":
-            self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_heads, 1)
+            self.intermed_cache = attn_output.abs().transpose(2, 3).reshape(-1, self.num_key_value_heads, self.num_key_value_groups).transpose(1, 2).reshape(-1, self.num_key_value_heads).mean(axis=0, keepdims=True).view(1, 1, self.num_key_value_heads, 1)
         elif self.prune_method == "wanda":
             ins_ = attn_output.reshape(bsz, q_len, self.hidden_size).reshape(-1, self.hidden_size).to(torch.float32)
             ins_ = (self.o_proj.weight.data.to(torch.float32).abs()) * (ins_.pow(2).mean(0, keepdim=True).sqrt())
-            self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_heads, -1).mean(axis=-1, keepdim=True)
+            self.intermed_cache = ins_.mean(axis=0).view(1, 1, self.num_key_value_heads, -1).mean(axis=-1, keepdim=True)
             if self.intermed_cache.isinf().any() or self.intermed_cache.isnan().any():
                 print("We hit a nan or inf. Resettinig ")
                 self.intermed_cache = torch.zeros_like(self.intermed_cache)
@@ -809,7 +809,8 @@ class LlamaSdpaAttention(LlamaAttention):
         if self.computing_updated_bias is not None:
             shape = attn_output.shape[-2:]
             self.intermed_cache = attn_output.reshape(-1, shape[0], shape[1]).mean(axis=0, keepdims=True).unsqueeze(0)
-            self.intermed_cache = (self.intermed_cache * self.computing_updated_bias).view(1, -1)
+            repeated_mask = self.computing_updated_bias.repeat(1, 1, self.num_key_value_groups, 1)
+            self.intermed_cache = (self.intermed_cache * repeated_mask).view(1, -1)
             self.intermed_cache = self.intermed_cache.matmul(self.o_proj.weight.T)
 
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
